@@ -227,6 +227,23 @@ def backtest_winners_curse_pairs_trade(df):
             return np.nan
         return (excess_daily.mean() / excess_daily.std()) * np.sqrt(tdays)
 
+    def realised_sharpe(daily_pnl_series, capital, rf_annual, tdays):
+        """
+        Realised Period Sharpe.
+        Scales by sqrt(n) not sqrt(252) — only extrapolates over
+        the actual number of days observed, not a full phantom year.
+        Drop the first row (entry day return = 0 by construction)
+        before calculating to avoid suppressing variance artificially.
+        """
+        pnl_for_metrics = daily_pnl_series.iloc[1:]      # drop entry day zero
+        n_actual        = len(pnl_for_metrics)            # recalculate after drop
+        daily_ret       = pnl_for_metrics / capital
+        rf_daily        = rf_annual / tdays 
+        excess_daily    = daily_ret - rf_daily
+        if excess_daily.std() == 0:
+            return np.nan
+        return (excess_daily.mean() / excess_daily.std()) * np.sqrt(n_actual)
+        
     def max_drawdown_dollars(cum_pnl_series):
         peak = cum_pnl_series.cummax()
         return (cum_pnl_series - peak).min()
@@ -245,7 +262,7 @@ def backtest_winners_curse_pairs_trade(df):
         metrics[label] = {
             'Final PnL':    trade_window[f'{prefix}_Cum_PnL'].iloc[-1],
             'Max Drawdown': max_drawdown_dollars(trade_window[f'{prefix}_Cum_PnL']),
-            'Sharpe':       annualised_sharpe(
+            'Sharpe':       realised_sharpe(
                                 trade_window[f'{prefix}_Daily_PnL'],
                                 CAPITAL, RISK_FREE, TRADING_DAYS
                             ),
