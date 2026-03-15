@@ -35,7 +35,8 @@ def add_milestones(ax):
         '2025-10-21': 'WBD Announces Potential Sale',
         '2025-11-12': 'Implied Volatility Peak',
         '2025-12-5':  'WBD Announces Agreement w/Netflix',
-        '2026-02-26': 'Netflix Exits Deal'
+        '2026-02-26': 'Netflix Exits Deal',
+        '2026-03-01': 'Paramount Finalizes $31 Offer'
     }
     for date_str, label in milestones.items():
         date_obj = pd.to_datetime(date_str)
