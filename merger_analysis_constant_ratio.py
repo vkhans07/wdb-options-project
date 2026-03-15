@@ -214,7 +214,11 @@ def backtest_winners_curse_pairs_trade(df):
     Executes exactly when Netflix exits the deal (2026-02-26).
 
     Key design decisions:
-    - Hedge ratio computed via shared compute_hedge_ratio(), lagged 1 day.
+    - Constant hedge ratio estimated via OLS on the pre-entry window
+      (all data before 2026-02-26). Locked in at entry, never rebalanced.
+      This is correct for an event-driven trade with a single catalyst
+      entry — rolling beta would implicitly resize the position daily,
+      adding unmodelled transaction costs and noise.
     - ALL three PnL series use the same daily-return method for consistency.
     - Day 1 return is 0 by construction (entry day, no prior close).
     - Borrow cost applied to the short PSKY leg at 50 bps annualised.
@@ -237,16 +241,28 @@ def backtest_winners_curse_pairs_trade(df):
     n_days = len(trade_window)
 
     # ------------------------------------------------------------------ #
-    # 2. HEDGE RATIO — from shared function, already lagged 1 day        #
+    # 2. HEDGE RATIO — constant beta estimated on pre-entry window only  #
+    #                                                                     #
+    #    β = Cov(NFLX_ret, PSKY_ret) / Var(PSKY_ret)                     #
+    #    Computed once on all data before Feb 26 and locked in for the   #
+    #    entire trade. No rebalancing, no look-ahead bias.                #
     # ------------------------------------------------------------------ #
-    hedge_series = compute_hedge_ratio(df, window=20)
-    hedge_map    = dict(zip(df['Date'], hedge_series))
-    trade_window['Hedge_Ratio'] = trade_window['Date'].map(hedge_map).fillna(1.0)
+    pre_entry     = df[(df['Date'] < trade_start) & (df['Date'] > '2026-01-01')].copy()
+    pre_nflx_ret  = pre_entry['NFLX'].pct_change().dropna()
+    pre_psky_ret  = pre_entry['PSKY'].pct_change().dropna()
+    aligned       = pd.concat([pre_nflx_ret, pre_psky_ret], axis=1).dropna()
+    aligned.columns = ['N', 'P']
+
+    if len(aligned) >= 2:
+        const_beta = pre_nflx_ret.cov(pre_psky_ret) / pre_psky_ret.var()
+    else:
+        const_beta = 1.0
+        print("  ⚠  Insufficient pre-entry data — defaulting β = 1.0")
 
     print(f"\nNFLX entry price:          ${trade_window['NFLX'].iloc[0]:.2f}")
     print(f"PSKY entry price:          ${trade_window['PSKY'].iloc[0]:.2f}")
-    print(f"Opening Hedge Ratio (β):   {trade_window['Hedge_Ratio'].iloc[0]:.4f}")
-    print(f"Closing Hedge Ratio (β):   {trade_window['Hedge_Ratio'].iloc[-1]:.4f}")
+    print(f"Constant Hedge Ratio (β):  {const_beta:.4f}  "
+          f"(OLS on {len(aligned)} pre-entry days)")
     print(f"Trade window:              {n_days} trading days\n")
 
     # ------------------------------------------------------------------ #
@@ -273,13 +289,13 @@ def backtest_winners_curse_pairs_trade(df):
     # Short PSKY: gains when PSKY falls; borrow cost is a daily drag
     trade_window['PSKY_Daily_PnL'] = (
         -CAPITAL * trade_window['PSKY_Ret']
-        - CAPITAL * daily_borrow  # borrow cost reduces PnL every day
+        - CAPITAL * daily_borrow
     )
 
     trade_window['Pair_Daily_PnL'] = (
           CAPITAL * trade_window['NFLX_Ret']
-        - CAPITAL * trade_window['Hedge_Ratio'] * trade_window['PSKY_Ret']
-        - CAPITAL * trade_window['Hedge_Ratio'] * daily_borrow  # scaled borrow
+        - CAPITAL * const_beta * trade_window['PSKY_Ret']
+        - CAPITAL * const_beta * daily_borrow
     )
 
     # ------------------------------------------------------------------ #
@@ -380,6 +396,7 @@ def backtest_winners_curse_pairs_trade(df):
     print(f"\nStarting Capital:   ${CAPITAL:>10,.2f}")
     print(f"Risk-Free Rate:      {RISK_FREE*100:.1f}% p.a.")
     print(f"Short Borrow Cost:   {BORROW_COST*100:.0f} bps p.a. (applied to short PSKY leg)")
+    print(f"Constant β:          {const_beta:.4f}  (OLS on pre-entry window)")
     print(f"Trade Entry:         {trade_window['Date'].iloc[0].strftime('%Y-%m-%d')}")
     print(f"Trade Exit:          {trade_window['Date'].iloc[-1].strftime('%Y-%m-%d')}")
     print(f"\nNOTE: 'Sharpe (Period)' scales by √n_actual — honest for short windows.")
@@ -415,6 +432,7 @@ def backtest_winners_curse_pairs_trade(df):
                      color='#d62728', alpha=0.12, label='Loss Zone')
     ax1.set_title(
         "Pairs Trade Cumulative P&L: Long NFLX / Short PSKY (β-Neutral)\n"
+        f"Constant β = {const_beta:.4f}  |  "
         f"Final PnL: ${pair_final:,.0f}  |  "
         f"Sharpe (Period): {pair_sharpe:.2f}  |  "
         f"Max DD: ${pair_mdd:,.0f}  |  Borrow Cost: 50 bps",
@@ -727,8 +745,8 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
     DataFrame (output of fetch_merger_data).
 
     Methodology is identical to backtest_winners_curse_pairs_trade():
-      - Hedge ratio = rolling Cov(LONG_ret, SHORT_ret) / Var(SHORT_ret),
-        lagged 1 day to eliminate look-ahead bias
+      - Constant hedge ratio estimated via OLS on the pre-entry window only.
+        β = Cov(LONG_ret, SHORT_ret) / Var(SHORT_ret), locked in at entry.
       - Long leg: +capital × LONG daily return
       - Short leg: -capital × β × SHORT daily return − borrow cost drag
       - Reports period Sharpe, annualised Sharpe, max drawdown, win rate
@@ -773,14 +791,24 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
         print("  ⚠  Insufficient pre-entry data for cointegration test.")
 
     # ------------------------------------------------------------------ #
-    # 2. HEDGE RATIO — rolling beta, lagged 1 day                        #
+    # 2. HEDGE RATIO — constant beta estimated on pre-entry window only  #
+    #                                                                     #
+    #    β = Cov(LONG_ret, SHORT_ret) / Var(SHORT_ret)                   #
+    #    Computed once on all data before entry date and locked in for   #
+    #    the entire trade. No rebalancing, no look-ahead bias.            #
     # ------------------------------------------------------------------ #
     df = df.copy()
-    df['LONG_Ret']    = df['LONG'].pct_change()
-    df['SHORT_Ret']   = df['SHORT'].pct_change()
-    roll_cov          = df['LONG_Ret'].rolling(hedge_window).cov(df['SHORT_Ret'])
-    roll_var          = df['SHORT_Ret'].rolling(hedge_window).var()
-    df['Hedge_Ratio'] = (roll_cov / roll_var).shift(1).fillna(1.0)
+    pre          = df[df['Date'] < entry].copy()
+    pre_long_ret = pre['LONG'].pct_change().dropna()
+    pre_short_ret= pre['SHORT'].pct_change().dropna()
+    aligned      = pd.concat([pre_long_ret, pre_short_ret], axis=1).dropna()
+    aligned.columns = ['L', 'S']
+
+    if len(aligned) >= 2:
+        const_beta = aligned['L'].cov(aligned['S']) / aligned['S'].var()
+    else:
+        const_beta = 1.0
+        print("  ⚠  Insufficient pre-entry data — defaulting β = 1.0")
 
     # ------------------------------------------------------------------ #
     # 3. ISOLATE TRADE WINDOW                                             #
@@ -793,7 +821,8 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
 
     print(f"\n  {long_label} entry price:  ${tw['LONG'].iloc[0]:.2f}")
     print(f"  {short_label} entry price: ${tw['SHORT'].iloc[0]:.2f}")
-    print(f"  Opening β:              {tw['Hedge_Ratio'].iloc[0]:.4f}")
+    print(f"  Constant β:             {const_beta:.4f}  "
+          f"(OLS on {len(aligned)} pre-entry days)")
     print(f"  Trade window:           {len(tw)} trading days")
 
     # ------------------------------------------------------------------ #
@@ -813,8 +842,8 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
     )
     tw['PAIR_Daily_PnL']  = (
           capital * tw['LONG_Ret']
-        - capital * tw['Hedge_Ratio'] * tw['SHORT_Ret']
-        - capital * tw['Hedge_Ratio'] * daily_borrow
+        - capital * const_beta * tw['SHORT_Ret']
+        - capital * const_beta * daily_borrow
     )
 
     # ------------------------------------------------------------------ #
@@ -881,6 +910,7 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
               + "".join(f"{fmt(metrics[c][key]):>{col_w}}" for c in cols))
     print(div)
     print(f"\n  Capital: ${capital:,.0f}  |  Borrow: {borrow_cost*100:.0f}bps  "
+          f"|  Constant β: {const_beta:.4f}  "
           f"|  Entry: {tw['Date'].iloc[0].date()}  "
           f"|  Exit: {tw['Date'].iloc[-1].date()}")
 
@@ -911,7 +941,8 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
                      where=(tw['PAIR_Cum_PnL'] < 0),
                      color='#d62728', alpha=0.12, label='Loss Zone')
     ax1.set_title(
-        f"{case_label}\nPairs Trade P&L: Long {long_label} / Short {short_label} (β-Neutral)\n"
+        f"{case_label}\nPairs Trade P&L: Long {long_label} / Short {short_label}  "
+        f"|  Constant β = {const_beta:.4f}\n"
         f"Final PnL: ${pair_final:,.0f}  |  Sharpe (Period): {pair_sharpe:.2f}  "
         f"|  Max DD: ${pair_mdd:,.0f}  |  Borrow: 50bps",
         fontweight='bold', pad=12
@@ -936,7 +967,7 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
              linestyle='--',
              label=f"Short {short_label} Only (${metrics[short_key]['Final PnL']:,.0f})")
     ax2.plot(dates, tw['PAIR_Cum_PnL'], color='#2ca02c', linewidth=2.5,
-             label=f"Pairs Trade β-Neutral (${pair_final:,.0f})")
+             label=f"Pairs Trade β={const_beta:.3f} (${pair_final:,.0f})")
     ax2.axhline(0, color='black', linestyle='--', alpha=0.4)
     ax2.set_title("Individual Leg Benchmarks vs. Pairs Strategy",
                   fontweight='bold', pad=8)
@@ -984,10 +1015,10 @@ def run_realworld_validation():
     print("=" * 60)
     print("""
   Methodology note:
-  In both cases below we apply the identical strategy from the WBD analysis:
+  In all cases below we apply the identical strategy from the WBD analysis:
     • Long the party that walked away / kept a clean balance sheet
     • Short the party that won and levered up
-    • Beta-neutral hedge ratio (20-day rolling, lagged 1 day)
+    • Constant beta estimated via OLS on the pre-entry window, locked in at entry
     • 50 bps annualised borrow cost on the short leg
     • $100,000 notional, 4.5% risk-free rate
   """)
