@@ -82,7 +82,7 @@ def calculate_quant_metrics(df):
     
     # Signal 2: Arbitrage Spread & Implied Probability
     df['Arb_Spread'] = 31.00 - df['WBD']
-    unaffected_price = df['WBD'].iloc[0] # Baseline price before rumors
+    unaffected_price = df['WBD'].iloc[0] # baseline price before rumors
     
     # Implied Prob = (Current - Unaffected) / (Offer - Unaffected)
     implied_prob = (df['WBD'] - unaffected_price) / (31.00 - unaffected_price)
@@ -93,6 +93,7 @@ def calculate_quant_metrics(df):
     df['PSKY_Ret'] = df['PSKY'].pct_change()
     rolling_cov = df['NFLX_Ret'].rolling(window=20).cov(df['PSKY_Ret'])
     rolling_var = df['PSKY_Ret'].rolling(window=20).var()
+    # simplest way to approximate beta is cov/var
     df['PSKY_NFLX_Beta'] = rolling_cov / rolling_var 
     
     print("\nLatest Signal Output (Last 3 Days of Data):")
@@ -100,6 +101,274 @@ def calculate_quant_metrics(df):
     print(df[cols_to_show].tail(3).to_string(index=False))
     
     return df
+
+def backtest_winners_curse_pairs_trade(df):
+    """
+    Backtests a Market-Neutral Pairs Trade: Long NFLX / Short PSKY.
+    Executes exactly when Netflix exits the deal (2026-02-26).
+
+    Key design decisions:
+    - Hedge ratio is lagged by 1 day to eliminate look-ahead bias.
+    - ALL three PnL series use the same daily-return method for
+      consistency. No mixing of price-level and daily-return approaches.
+    - Day 1 return is 0 by construction (entry day, no prior close).
+    """
+    print("\n" + "=" * 60)
+    print("  BACKTEST: THE WINNER'S CURSE (LONG NFLX / SHORT PSKY)")
+    print("=" * 60)
+
+    # ------------------------------------------------------------------ #
+    # 1. ISOLATE THE POST-DEAL WINDOW (Phase 2)                           #
+    # ------------------------------------------------------------------ #
+    trade_start  = pd.to_datetime('2026-02-26')
+    trade_window = df[df['Date'] >= trade_start].copy().reset_index(drop=True)
+
+    if trade_window.empty:
+        print("ERROR: No data found on or after 2026-02-26. Aborting.")
+        return
+
+    n_days = len(trade_window)
+
+    # ------------------------------------------------------------------ #
+    # 2. HEDGE RATIO — computed on full history, LAGGED by 1 day         #
+    #                                                                     #
+    #    Rolling beta: β = Cov(NFLX_ret, PSKY_ret) / Var(PSKY_ret)       #
+    #    Shift(1) ensures the beta used on day T was computed through     #
+    #    day T-1 only. This eliminates look-ahead bias on the signal.     #
+    # ------------------------------------------------------------------ #
+    df_work = df.copy()
+    df_work['_nflx_ret'] = df_work['NFLX'].pct_change()
+    df_work['_psky_ret'] = df_work['PSKY'].pct_change()
+
+    rolling_cov            = df_work['_nflx_ret'].rolling(20).cov(df_work['_psky_ret'])
+    rolling_var            = df_work['_psky_ret'].rolling(20).var()
+    # --- KEY FIX: lag by 1 so entry-day beta uses only prior history ---
+    df_work['Hedge_Ratio'] = (rolling_cov / rolling_var).shift(1).fillna(1.0)
+
+    # Pull hedge ratios that correspond to our trade window dates
+    trade_window = trade_window.merge(
+        df_work[['Date', 'Hedge_Ratio']],
+        on='Date',
+        how='left'
+    )
+    trade_window['Hedge_Ratio'] = trade_window['Hedge_Ratio'].fillna(1.0)
+
+    # ------------------------------------------------------------------ #
+    # 3. DAILY RETURNS — consistent pct_change on the sliced window      #
+    #                                                                     #
+    #    pct_change() on row 0 of the slice = NaN → filled to 0.         #
+    #    This is correct: on entry day you hold no position yet,         #
+    #    so your P&L for that day is $0.                                  #
+    # ------------------------------------------------------------------ #
+    trade_window['NFLX_Ret'] = trade_window['NFLX'].pct_change().fillna(0)
+    trade_window['PSKY_Ret'] = trade_window['PSKY'].pct_change().fillna(0)
+
+    # ------------------------------------------------------------------ #
+    # 4. PORTFOLIO PARAMETERS                                             #
+    # ------------------------------------------------------------------ #
+    CAPITAL      = 100_000   # $100k notional
+    RISK_FREE    = 0.045     # 4.5% annualised risk-free rate
+    TRADING_DAYS = 252
+
+    nflx_entry = trade_window['NFLX'].iloc[0]
+    psky_entry = trade_window['PSKY'].iloc[0]
+
+    print(f"\nNFLX entry price:          ${nflx_entry:.2f}")
+    print(f"PSKY entry price:          ${psky_entry:.2f}")
+    print(f"Opening Hedge Ratio (β):   {trade_window['Hedge_Ratio'].iloc[0]:.4f}")
+    print(f"Closing Hedge Ratio (β):   {trade_window['Hedge_Ratio'].iloc[-1]:.4f}")
+    print(f"Trade window:              {n_days} trading days\n")
+
+    # ------------------------------------------------------------------ #
+    # 5. DAILY P&L — all three legs use the SAME daily-return method     #
+    #                                                                     #
+    #    (a) Long NFLX:  +$CAPITAL × NFLX daily return                   #
+    #    (b) Short PSKY: -$CAPITAL × PSKY daily return                   #
+    #        (negative because gains when PSKY falls)                     #
+    #    (c) Pairs Trade: (a) + beta-scaled (b)                           #
+    #                                                                     #
+    #    All three are DAILY incremental dollars. Cumulative PnL is       #
+    #    obtained with a single .cumsum() on each. No mixing of           #
+    #    price-level and daily-return methods anywhere.                   #
+    # ------------------------------------------------------------------ #
+    trade_window['NFLX_Daily_PnL'] = CAPITAL * trade_window['NFLX_Ret']
+    trade_window['PSKY_Daily_PnL'] = -CAPITAL * trade_window['PSKY_Ret']
+    trade_window['Pair_Daily_PnL'] = (
+          CAPITAL * trade_window['NFLX_Ret']                              # long leg
+        - CAPITAL * trade_window['Hedge_Ratio'] * trade_window['PSKY_Ret'] # short leg
+    )
+
+    # ------------------------------------------------------------------ #
+    # 6. CUMULATIVE P&L                                                   #
+    #    Each .cumsum() operates on the DAILY incremental series above.   #
+    # ------------------------------------------------------------------ #
+    trade_window['NFLX_Cum_PnL'] = trade_window['NFLX_Daily_PnL'].cumsum()
+    trade_window['PSKY_Cum_PnL'] = trade_window['PSKY_Daily_PnL'].cumsum()
+    trade_window['Pair_Cum_PnL'] = trade_window['Pair_Daily_PnL'].cumsum()
+
+    # ------------------------------------------------------------------ #
+    # 7. DRAWDOWN — peak-to-trough on the pairs strategy                 #
+    # ------------------------------------------------------------------ #
+    trade_window['Pair_Peak']     = trade_window['Pair_Cum_PnL'].cummax()
+    trade_window['Pair_Drawdown'] = trade_window['Pair_Cum_PnL'] - trade_window['Pair_Peak']
+
+    # ------------------------------------------------------------------ #
+    # 8. PERFORMANCE METRICS                                              #
+    # ------------------------------------------------------------------ #
+    def annualised_sharpe(daily_pnl_series, capital, rf_annual, tdays):
+        """
+        Sharpe = (mean_daily_excess_return / std_daily_return) * sqrt(252)
+        Converts dollar PnL to a return by dividing by capital.
+        """
+        daily_ret    = daily_pnl_series / capital
+        rf_daily     = rf_annual / tdays
+        excess_daily = daily_ret - rf_daily
+        if excess_daily.std() == 0:
+            return np.nan
+        return (excess_daily.mean() / excess_daily.std()) * np.sqrt(tdays)
+
+    def max_drawdown_dollars(cum_pnl_series):
+        peak = cum_pnl_series.cummax()
+        return (cum_pnl_series - peak).min()
+
+    def win_rate_pct(daily_pnl_series):
+        return (daily_pnl_series > 0).mean() * 100
+
+    strategies = {
+        'Long NFLX Only':        'NFLX',
+        'Short PSKY Only':       'PSKY',
+        'Pairs Trade (β-Neutral)': 'Pair',
+    }
+
+    metrics = {}
+    for label, prefix in strategies.items():
+        metrics[label] = {
+            'Final PnL':    trade_window[f'{prefix}_Cum_PnL'].iloc[-1],
+            'Max Drawdown': max_drawdown_dollars(trade_window[f'{prefix}_Cum_PnL']),
+            'Sharpe':       annualised_sharpe(
+                                trade_window[f'{prefix}_Daily_PnL'],
+                                CAPITAL, RISK_FREE, TRADING_DAYS
+                            ),
+            'Win Rate':     win_rate_pct(trade_window[f'{prefix}_Daily_PnL']),
+        }
+
+    # ------------------------------------------------------------------ #
+    # 9. PRINT PERFORMANCE TABLE                                          #
+    # ------------------------------------------------------------------ #
+    col_w   = 26
+    lbl_w   = 22
+    divider = "-" * (lbl_w + col_w * 3)
+
+    print(divider)
+    print(f"{'Metric':<{lbl_w}}"
+          f"{'Long NFLX Only':>{col_w}}"
+          f"{'Short PSKY Only':>{col_w}}"
+          f"{'Pairs Trade (β-Neutral)':>{col_w}}")
+    print(divider)
+
+    rows = [
+        ('Final Net PnL',  'Final PnL',    lambda v: f"${v:>10,.2f}"),
+        ('Max Drawdown',   'Max Drawdown', lambda v: f"${v:>10,.2f}"),
+        ('Sharpe Ratio',   'Sharpe',       lambda v: f"{v:>12.3f}"),
+        ('Daily Win Rate', 'Win Rate',     lambda v: f"{v:>11.1f}%"),
+    ]
+    for display, key, fmt in rows:
+        print(f"{display:<{lbl_w}}"
+              + "".join(f"{fmt(metrics[s][key]):>{col_w}}" for s in metrics))
+
+    print(divider)
+    print(f"\nStarting Capital:  ${CAPITAL:>10,.2f}")
+    print(f"Risk-Free Rate:     {RISK_FREE*100:.1f}% p.a.")
+    print(f"Trade Entry:        {trade_window['Date'].iloc[0].strftime('%Y-%m-%d')}")
+    print(f"Trade Exit:         {trade_window['Date'].iloc[-1].strftime('%Y-%m-%d')}")
+
+    # ------------------------------------------------------------------ #
+    # 10. 3-PANEL CHART                                                   #
+    #     Panel 1 — Pairs strategy hero PnL with shaded profit/loss      #
+    #     Panel 2 — All three legs overlaid for comparison               #
+    #     Panel 3 — Pairs strategy drawdown                              #
+    # ------------------------------------------------------------------ #
+    os.makedirs('charts', exist_ok=True)
+
+    fig, axes = plt.subplots(
+        3, 1,
+        figsize=(14, 14),
+        gridspec_kw={'height_ratios': [3, 2, 1.5]},
+        sharex=True
+    )
+
+    dates      = trade_window['Date']
+    pair_final = metrics['Pairs Trade (β-Neutral)']['Final PnL']
+    pair_sharpe= metrics['Pairs Trade (β-Neutral)']['Sharpe']
+    pair_mdd   = metrics['Pairs Trade (β-Neutral)']['Max Drawdown']
+
+    # ── Panel 1: Pairs strategy ───────────────────────────────────────
+    ax1 = axes[0]
+    ax1.plot(dates, trade_window['Pair_Cum_PnL'],
+             color='#2ca02c', linewidth=2.5,
+             label='Long NFLX / Short PSKY (β-Neutral)')
+    ax1.axhline(0, color='black', linestyle='--', alpha=0.4)
+    ax1.fill_between(dates, trade_window['Pair_Cum_PnL'], 0,
+                     where=(trade_window['Pair_Cum_PnL'] >= 0),
+                     color='#2ca02c', alpha=0.12, label='Profit Zone')
+    ax1.fill_between(dates, trade_window['Pair_Cum_PnL'], 0,
+                     where=(trade_window['Pair_Cum_PnL'] < 0),
+                     color='#d62728', alpha=0.12, label='Loss Zone')
+    ax1.set_title(
+        "Pairs Trade Cumulative P&L: Long NFLX / Short PSKY (β-Neutral)\n"
+        f"Final PnL: ${pair_final:,.0f}  |  "
+        f"Sharpe: {pair_sharpe:.2f}  |  "
+        f"Max DD: ${pair_mdd:,.0f}",
+        fontweight='bold', pad=12
+    )
+    ax1.set_ylabel("Cumulative P&L ($)")
+    ax1.legend(loc='upper left', fontsize=10)
+
+    trans = transforms.blended_transform_factory(ax1.transData, ax1.transAxes)
+    ax1.axvline(trade_start, color='black', linestyle='-.', alpha=0.7, linewidth=1.5)
+    ax1.text(trade_start, 0.95, '  Trade Entry (Netflix Exits)',
+             transform=trans, rotation=90, va='top', ha='right',
+             fontsize=9, fontweight='bold', color='#333333')
+
+    # ── Panel 2: All three legs ───────────────────────────────────────
+    ax2 = axes[1]
+    ax2.plot(dates, trade_window['NFLX_Cum_PnL'],
+             color='#d62728', linewidth=2, linestyle='--',
+             label=f"Long NFLX Only  (${metrics['Long NFLX Only']['Final PnL']:,.0f})")
+    ax2.plot(dates, trade_window['PSKY_Cum_PnL'],
+             color='#ff7f0e', linewidth=2, linestyle='--',
+             label=f"Short PSKY Only (${metrics['Short PSKY Only']['Final PnL']:,.0f})")
+    ax2.plot(dates, trade_window['Pair_Cum_PnL'],
+             color='#2ca02c', linewidth=2.5,
+             label=f"Pairs Trade β-Neutral (${pair_final:,.0f})")
+    ax2.axhline(0, color='black', linestyle='--', alpha=0.4)
+    ax2.set_title("Individual Leg Benchmarks vs. Pairs Strategy",
+                  fontweight='bold', pad=8)
+    ax2.set_ylabel("Cumulative P&L ($)")
+    ax2.legend(loc='upper left', fontsize=10)
+
+    # ── Panel 3: Drawdown ─────────────────────────────────────────────
+    ax3 = axes[2]
+    ax3.fill_between(dates, trade_window['Pair_Drawdown'], 0,
+                     color='#d62728', alpha=0.4)
+    ax3.plot(dates, trade_window['Pair_Drawdown'],
+             color='#d62728', linewidth=1.5, label='Drawdown')
+    ax3.axhline(pair_mdd, color='darkred', linestyle=':',
+                linewidth=1.5,
+                label=f"Max Drawdown: ${pair_mdd:,.0f}")
+    ax3.set_title("Pairs Strategy Drawdown", fontweight='bold', pad=8)
+    ax3.set_ylabel("Drawdown ($)")
+    ax3.legend(loc='lower left', fontsize=10)
+
+    ax3.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO))
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
+    plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    plt.tight_layout(h_pad=2.5)
+    out_path = 'charts/pairs_trade_pnl.png'
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"\nSaved 3-panel backtest chart → '{out_path}'")
 
 def main():
     print("Loading and cleaning data...")
@@ -177,6 +446,8 @@ def main():
     format_x_axis(ax4)
     plt.savefig(f'{output_dir}/chart4_winners_curse.png')
     plt.close(fig4)
+
+    backtest_winners_curse_pairs_trade(df)
 
     # Save the enriched data to CSV for final review
     df.to_csv('data/enriched_signals_output.csv', index=False)
