@@ -14,7 +14,10 @@ For each case you get 3 charts:
 Cases:
   ① Anadarko (2019) — CVX vs OXY   ← cleanest bidding war analog
   ② Hulu (2023)     — CMCSA vs DIS
-  ③ WWE (2023)      — FOXA vs EDR
+  ③ KSU (2021)      — CNI vs CP
+
+Hedge ratio methodology: CONSTANT beta estimated via OLS on the
+pre-entry window only. Locked in at trade entry, never rebalanced.
 
 Requirements:
   pip install yfinance statsmodels pandas numpy matplotlib scipy seaborn
@@ -163,15 +166,39 @@ def compute_spread_zscore(df, hedge_ratio, window=HEDGE_WINDOW):
 
 def run_backtest(df, entry_date):
     """
-    Beta-neutral pairs backtest.
-    Returns trade_window DataFrame with all PnL columns populated,
-    plus a metrics dict.
-    """
-    entry = pd.to_datetime(entry_date)
-    df    = df.copy()
+    Beta-neutral pairs backtest using a CONSTANT hedge ratio.
 
-    # Hedge ratio on full history (lagged)
-    df['Hedge_Ratio'] = compute_hedge_ratio(df)
+    Beta is estimated once via OLS on the pre-entry window only:
+        β = Cov(LONG_ret, SHORT_ret) / Var(SHORT_ret)
+    This single value is locked in at trade entry and held fixed for
+    the entire trade window — no rebalancing, no look-ahead bias.
+
+    Using a constant beta is correct here because:
+      - We enter on a single catalyst date and hold; there is no
+        ongoing rebalancing logic in this strategy
+      - Rolling beta would implicitly resize the position daily,
+        adding unmodelled transaction costs
+      - The pre-entry window gives the cleanest estimate of the
+        structural relationship before deal noise contaminates it
+    """
+    entry    = pd.to_datetime(entry_date)
+    df       = df.copy()
+    pre      = df[df['Date'] < entry].copy()
+
+    if len(pre) < HEDGE_WINDOW:
+        print(f"  ⚠  Only {len(pre)} pre-entry days — beta estimate unreliable.")
+
+    # OLS beta on pre-entry returns
+    pre_long_ret  = pre['LONG'].pct_change().dropna()
+    pre_short_ret = pre['SHORT'].pct_change().dropna()
+    aligned       = pd.concat([pre_long_ret, pre_short_ret], axis=1).dropna()
+    aligned.columns = ['L', 'S']
+
+    if len(aligned) >= 2:
+        const_beta = aligned['L'].cov(aligned['S']) / aligned['S'].var()
+    else:
+        const_beta = 1.0
+        print("  ⚠  Insufficient pre-entry data — defaulting β = 1.0")
 
     tw = df[df['Date'] >= entry].copy().reset_index(drop=True)
     if tw.empty:
@@ -185,14 +212,16 @@ def run_backtest(df, entry_date):
     tw['SHORT_Daily_PnL'] = (-CAPITAL * tw['SHORT_Ret']
                              - CAPITAL * daily_borrow)
     tw['PAIR_Daily_PnL']  = (CAPITAL * tw['LONG_Ret']
-                             - CAPITAL * tw['Hedge_Ratio'] * tw['SHORT_Ret']
-                             - CAPITAL * tw['Hedge_Ratio'] * daily_borrow)
+                             - CAPITAL * const_beta * tw['SHORT_Ret']
+                             - CAPITAL * const_beta * daily_borrow)
 
+    # Cumulative return as % of capital
     for leg in ('LONG', 'SHORT', 'PAIR'):
-        tw[f'{leg}_Cum_PnL'] = tw[f'{leg}_Daily_PnL'].cumsum()
+        tw[f'{leg}_Cum_Ret'] = (tw[f'{leg}_Daily_PnL'].cumsum() / CAPITAL) * 100
 
-    tw['PAIR_Peak']     = tw['PAIR_Cum_PnL'].cummax()
-    tw['PAIR_Drawdown'] = tw['PAIR_Cum_PnL'] - tw['PAIR_Peak']
+    # Drawdown as % of capital
+    tw['PAIR_Peak_Ret']     = tw['PAIR_Cum_Ret'].cummax()
+    tw['PAIR_Drawdown_Pct'] = tw['PAIR_Cum_Ret'] - tw['PAIR_Peak_Ret']
 
     def _sharpe(pnl, scale):
         s = pnl.iloc[1:]
@@ -200,17 +229,13 @@ def run_backtest(df, entry_date):
         return (e.mean() / e.std()) * np.sqrt(scale) if e.std() != 0 else np.nan
 
     metrics = {
-        'Final PnL':        tw['PAIR_Cum_PnL'].iloc[-1],
-        'Max Drawdown':     (tw['PAIR_Cum_PnL'] - tw['PAIR_Cum_PnL'].cummax()).min(),
+        'Final Ret %':      tw['PAIR_Cum_Ret'].iloc[-1],
+        'Max Drawdown %':   (tw['PAIR_Cum_Ret'] - tw['PAIR_Cum_Ret'].cummax()).min(),
         'Sharpe (Period)':  _sharpe(tw['PAIR_Daily_PnL'], len(tw) - 1),
         'Sharpe (Annual)':  _sharpe(tw['PAIR_Daily_PnL'], TRADING_DAYS),
         'Win Rate':         (tw['PAIR_Daily_PnL'] > 0).mean() * 100,
-        'Beta Entry':       tw['Hedge_Ratio'].iloc[0],
-        'Beta Exit':        tw['Hedge_Ratio'].iloc[-1],
-        'Beta Mean':        tw['Hedge_Ratio'].mean(),
-        'Beta Min':         tw['Hedge_Ratio'].min(),
-        'Beta Max':         tw['Hedge_Ratio'].max(),
-        'Beta Std':         tw['Hedge_Ratio'].std(),
+        'Const Beta':       const_beta,
+        'Pre-Entry Days':   len(aligned),
     }
 
     return tw, metrics
@@ -332,11 +357,11 @@ def chart_spread_zscore(df, case, case_key):
 
 def chart_backtest_pnl(df, tw, metrics, case, case_key):
     """
-    Chart 3 of 3: 4-panel backtest chart.
-      Panel 1 — Pairs strategy cumulative PnL with profit/loss shading
+    Chart 3 of 3: 3-panel backtest chart.
+      Panel 1 — Pairs strategy cumulative return (%) with profit/loss shading
       Panel 2 — All three legs overlaid (long only, short only, pairs)
-      Panel 3 — Drawdown
-      Panel 4 — Rolling hedge ratio (β) over the trade window
+      Panel 3 — Drawdown (%)
+    Constant beta is reported in the Panel 1 title.
     """
     if tw is None or metrics is None:
         print(f"  [3/3] Skipped — backtest returned no data.")
@@ -344,35 +369,45 @@ def chart_backtest_pnl(df, tw, metrics, case, case_key):
 
     entry      = pd.to_datetime(case['entry_date'])
     dates      = tw['Date']
-    pair_final = metrics['Final PnL']
+    pair_final = metrics['Final Ret %']
     pair_sp    = metrics['Sharpe (Period)']
-    pair_mdd   = metrics['Max Drawdown']
+    pair_mdd   = metrics['Max Drawdown %']
+    const_beta = metrics['Const Beta']
+
+    long_final   = tw['LONG_Cum_Ret'].iloc[-1]
+    short_final  = tw['SHORT_Cum_Ret'].iloc[-1]
+    long_ticker  = case['long_ticker']
+    short_ticker = case['short_ticker']
+
+    pct_fmt = plt.FuncFormatter(lambda v, _: f'{v:.1f}%')
 
     fig, axes = plt.subplots(
-        4, 1, figsize=(14, 18),
-        gridspec_kw={'height_ratios': [3, 2, 1.5, 1.5]},
+        3, 1, figsize=(14, 14),
+        gridspec_kw={'height_ratios': [3, 2, 1.5]},
         sharex=True
     )
 
-    # ── Panel 1: Pairs PnL ────────────────────────────────────────────
+    # ── Panel 1: Pairs cumulative return ──────────────────────────────
     ax1 = axes[0]
-    ax1.plot(dates, tw['PAIR_Cum_PnL'], color='#2ca02c', linewidth=2.5,
+    ax1.plot(dates, tw['PAIR_Cum_Ret'], color='#2ca02c', linewidth=2.5,
              label=f"Long {case['long_label']} / Short {case['short_label']} (β-Neutral)")
     ax1.axhline(0, color='black', linestyle='--', alpha=0.4)
-    ax1.fill_between(dates, tw['PAIR_Cum_PnL'], 0,
-                     where=(tw['PAIR_Cum_PnL'] >= 0),
+    ax1.fill_between(dates, tw['PAIR_Cum_Ret'], 0,
+                     where=(tw['PAIR_Cum_Ret'] >= 0),
                      color='#2ca02c', alpha=0.12, label='Profit Zone')
-    ax1.fill_between(dates, tw['PAIR_Cum_PnL'], 0,
-                     where=(tw['PAIR_Cum_PnL'] < 0),
+    ax1.fill_between(dates, tw['PAIR_Cum_Ret'], 0,
+                     where=(tw['PAIR_Cum_Ret'] < 0),
                      color='#d62728', alpha=0.12, label='Loss Zone')
+    ax1.yaxis.set_major_formatter(pct_fmt)
     ax1.set_title(
         f"{case['title']}\n"
-        f"Pairs Trade Cumulative P&L (β-Neutral, after 50bps borrow cost)\n"
-        f"Final PnL: ${pair_final:,.0f}  |  Sharpe (Period): {pair_sp:.2f}  "
-        f"|  Max DD: ${pair_mdd:,.0f}",
+        f"Pairs Trade Cumulative Return  |  Constant β = {const_beta:.4f}  "
+        f"(estimated on {metrics['Pre-Entry Days']} pre-entry days)  |  50bps borrow\n"
+        f"Final Return: {pair_final:.2f}%  |  Sharpe (Period): {pair_sp:.2f}  "
+        f"|  Max DD: {pair_mdd:.2f}%",
         fontweight='bold', pad=12
     )
-    ax1.set_ylabel('Cumulative P&L ($)')
+    ax1.set_ylabel('Cumulative Return (%)')
     ax1.legend(loc='upper left', fontsize=10)
 
     trans = transforms.blended_transform_factory(ax1.transData, ax1.transAxes)
@@ -383,82 +418,34 @@ def chart_backtest_pnl(df, tw, metrics, case, case_key):
 
     # ── Panel 2: Individual legs ──────────────────────────────────────
     ax2 = axes[1]
-    long_final   = tw['LONG_Cum_PnL'].iloc[-1]
-    short_final  = tw['SHORT_Cum_PnL'].iloc[-1]
-    long_ticker  = case['long_ticker']
-    short_ticker = case['short_ticker']
-
-    ax2.plot(dates, tw['LONG_Cum_PnL'],  color='#1f77b4', linewidth=2,
-             linestyle='--', label=f"Long {long_ticker} Only  (${long_final:,.0f})")
-    ax2.plot(dates, tw['SHORT_Cum_PnL'], color='#ff7f0e', linewidth=2,
-             linestyle='--', label=f"Short {short_ticker} Only (${short_final:,.0f})")
-    ax2.plot(dates, tw['PAIR_Cum_PnL'],  color='#2ca02c', linewidth=2.5,
-             label=f"Pairs Trade β-Neutral (${pair_final:,.0f})")
+    ax2.plot(dates, tw['LONG_Cum_Ret'],  color='#1f77b4', linewidth=2,
+             linestyle='--', label=f"Long {long_ticker} Only  ({long_final:.2f}%)")
+    ax2.plot(dates, tw['SHORT_Cum_Ret'], color='#ff7f0e', linewidth=2,
+             linestyle='--', label=f"Short {short_ticker} Only ({short_final:.2f}%)")
+    ax2.plot(dates, tw['PAIR_Cum_Ret'],  color='#2ca02c', linewidth=2.5,
+             label=f"Pairs Trade β={const_beta:.3f} ({pair_final:.2f}%)")
     ax2.axhline(0, color='black', linestyle='--', alpha=0.4)
+    ax2.yaxis.set_major_formatter(pct_fmt)
     ax2.set_title('Individual Leg Benchmarks vs. Pairs Strategy',
                   fontweight='bold', pad=8)
-    ax2.set_ylabel('Cumulative P&L ($)')
+    ax2.set_ylabel('Cumulative Return (%)')
     ax2.legend(loc='upper left', fontsize=10)
 
     # ── Panel 3: Drawdown ─────────────────────────────────────────────
     ax3 = axes[2]
-    ax3.fill_between(dates, tw['PAIR_Drawdown'], 0, color='#d62728', alpha=0.4)
-    ax3.plot(dates, tw['PAIR_Drawdown'], color='#d62728', linewidth=1.5,
+    ax3.fill_between(dates, tw['PAIR_Drawdown_Pct'], 0, color='#d62728', alpha=0.4)
+    ax3.plot(dates, tw['PAIR_Drawdown_Pct'], color='#d62728', linewidth=1.5,
              label='Drawdown')
     ax3.axhline(pair_mdd, color='darkred', linestyle=':', linewidth=1.5,
-                label=f'Max Drawdown: ${pair_mdd:,.0f}')
-    ax3.set_title('Pairs Strategy Drawdown', fontweight='bold', pad=8)
-    ax3.set_ylabel('Drawdown ($)')
+                label=f'Max Drawdown: {pair_mdd:.2f}%')
+    ax3.yaxis.set_major_formatter(pct_fmt)
+    ax3.set_title('Pairs Strategy Drawdown (%)', fontweight='bold', pad=8)
+    ax3.set_ylabel('Drawdown (%)')
     ax3.legend(loc='lower left', fontsize=10)
 
-    # ── Panel 4: Rolling hedge ratio (β) ──────────────────────────────
-    ax4 = axes[3]
-    ax4.plot(dates, tw['Hedge_Ratio'], color='#9467bd', linewidth=2,
-             label='Rolling β (20-day, lagged 1d)')
-    ax4.axhline(metrics['Beta Mean'], color='#9467bd', linestyle='--',
-                alpha=0.6, linewidth=1.2,
-                label=f"Mean β = {metrics['Beta Mean']:.3f}")
-    ax4.axhline(1.0, color='black', linestyle=':', alpha=0.3, linewidth=1)
-
-    # Shade ±1 std band around mean
-    beta_mean = metrics['Beta Mean']
-    beta_std  = metrics['Beta Std']
-    ax4.fill_between(dates,
-                     beta_mean - beta_std,
-                     beta_mean + beta_std,
-                     color='#9467bd', alpha=0.08,
-                     label=f'±1σ band  (σ = {beta_std:.3f})')
-
-    # Annotate entry and exit values
-    ax4.annotate(
-        f"Entry β={metrics['Beta Entry']:.3f}",
-        xy=(dates.iloc[0], metrics['Beta Entry']),
-        xytext=(dates.iloc[min(5, len(dates)-1)], metrics['Beta Entry'] + beta_std * 0.6),
-        fontsize=9, color='#9467bd', fontweight='bold',
-        arrowprops=dict(arrowstyle='->', color='#9467bd', lw=1.2),
-    )
-    ax4.annotate(
-        f"Exit β={metrics['Beta Exit']:.3f}",
-        xy=(dates.iloc[-1], metrics['Beta Exit']),
-        xytext=(dates.iloc[max(-6, -len(dates))], metrics['Beta Exit'] + beta_std * 0.6),
-        fontsize=9, color='#555555', fontweight='bold',
-        arrowprops=dict(arrowstyle='->', color='#555555', lw=1.2),
-    )
-
-    ax4.set_title(
-        f"Rolling Hedge Ratio β  "
-        f"(Entry: {metrics['Beta Entry']:.3f}  |  "
-        f"Exit: {metrics['Beta Exit']:.3f}  |  "
-        f"Mean: {metrics['Beta Mean']:.3f}  |  "
-        f"Range: {metrics['Beta Min']:.3f}–{metrics['Beta Max']:.3f})",
-        fontweight='bold', pad=8
-    )
-    ax4.set_ylabel('Hedge Ratio (β)')
-    ax4.legend(loc='upper left', fontsize=9)
-
-    ax4.xaxis.set_major_locator(mdates.MonthLocator())
-    ax4.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-    plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    ax3.xaxis.set_major_locator(mdates.MonthLocator())
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
     plt.tight_layout(h_pad=2.5)
     path = f"{OUTPUT_DIR}/{case_key}_3_backtest_pnl.png"
@@ -468,90 +455,366 @@ def chart_backtest_pnl(df, tw, metrics, case, case_key):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY 2: DYNAMIC MOMENTUM PAIRS TRADE
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Motivation: The static strategy (always Long LONG / Short SHORT) fails badly
+# in cases where the market rewards the "winner" instead of the "loser" — i.e.,
+# when the Winner's Curse thesis inverts. Rather than assuming direction, this
+# strategy waits for the spread to reveal which way momentum is actually running
+# and trades that direction.
+#
+# Signal logic (z-score of β-adjusted spread, 20-day rolling window):
+#   +2σ breach  → enter LONG the spread (Long LONG / Short SHORT)
+#   -2σ breach  → enter SHORT the spread (Short LONG / Long SHORT) = inversion
+#   Cross 0     → exit current position
+#   New signal in opposite direction while in position → flip
+#
+# Position sizing: same $100k notional as static strategy.
+# Borrow cost: applied on the short leg regardless of direction.
+# Direction is determined day-to-day from the previous day's z-score
+# (lagged by 1 to avoid look-ahead bias).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_dynamic_backtest(df, entry_date, zscore_entry=2.0, zscore_exit=0.0):
+    """
+    Dynamic momentum pairs trade: direction determined by rolling spread z-score.
+    Hedge ratio is ROLLING (20-day Cov/Var, lagged 1 day) — re-estimated every
+    day so the position size adjusts as the relationship evolves. This is
+    appropriate here because the strategy re-enters on fresh signals rather than
+    holding a single position from a fixed entry date.
+
+    Parameters
+    ----------
+    df            : full DataFrame (fetch_start → fetch_end)
+    entry_date    : str  — trade window opens from this date
+    zscore_entry  : float — z-score threshold to open/flip a position (default ±2)
+    zscore_exit   : float — z-score threshold to exit a position (default 0)
+
+    Returns
+    -------
+    tw      : trade-window DataFrame with dynamic PnL columns
+    metrics : dict of performance metrics
+    """
+    entry = pd.to_datetime(entry_date)
+    df    = df.copy()
+
+    # ── Rolling beta on FULL history, lagged 1 day ────────────────────
+    # β_t = Cov(LONG_ret, SHORT_ret)[t-1:t-20] / Var(SHORT_ret)[t-1:t-20]
+    # Using the full history (not just pre-entry) so the estimate is always
+    # based on the most recent 20 days of actual realized co-movement.
+    # Lagged by 1 to avoid look-ahead bias.
+    lr_full   = df['LONG'].pct_change()
+    sr_full   = df['SHORT'].pct_change()
+    roll_beta = (
+        lr_full.rolling(HEDGE_WINDOW).cov(sr_full)
+        / sr_full.rolling(HEDGE_WINDOW).var()
+    ).shift(1).fillna(1.0)
+    df['Roll_Beta'] = roll_beta
+
+    # ── Z-score computed on FULL history using rolling beta ───────────
+    df['_lr'] = np.log(df['LONG']  / df['LONG'].shift(1))
+    df['_sr'] = np.log(df['SHORT'] / df['SHORT'].shift(1))
+    spread    = df['_lr'] - df['Roll_Beta'] * df['_sr']
+    s_mean    = spread.rolling(HEDGE_WINDOW).mean()
+    s_std     = spread.rolling(HEDGE_WINDOW).std()
+    df['ZScore'] = (spread - s_mean) / s_std
+
+    # ── Trade window ──────────────────────────────────────────────────
+    tw = df[df['Date'] >= entry].copy().reset_index(drop=True)
+    if tw.empty:
+        return None, None
+
+    tw['LONG_Ret']  = tw['LONG'].pct_change().fillna(0)
+    tw['SHORT_Ret'] = tw['SHORT'].pct_change().fillna(0)
+    daily_borrow    = BORROW_COST / TRADING_DAYS
+
+    # ── Signal generation (lagged by 1 — no look-ahead) ──────────────
+    z        = tw['ZScore'].shift(1).fillna(0)
+    position = np.zeros(len(tw))
+    current  = 0
+
+    for i in range(len(tw)):
+        zi = z.iloc[i]
+        if current == 0:
+            if zi >= zscore_entry:
+                current = 1
+            elif zi <= -zscore_entry:
+                current = -1
+        elif current == 1:
+            if zi <= zscore_exit:
+                current = 0
+            elif zi <= -zscore_entry:
+                current = -1
+        elif current == -1:
+            if zi >= -zscore_exit:
+                current = 0
+            elif zi >= zscore_entry:
+                current = 1
+        position[i] = current
+
+    tw['Position'] = position
+
+    # ── Daily P&L using rolling beta for position sizing ─────────────
+    # The rolling beta sizes the short leg — on any given day the hedge
+    # ratio is whatever the last 20 days of co-movement implied.
+    tw['DYN_Daily_PnL'] = (
+        tw['Position'] * (
+            CAPITAL * tw['LONG_Ret']
+            - CAPITAL * tw['Roll_Beta'] * tw['SHORT_Ret']
+        )
+        - abs(tw['Position']) * CAPITAL * tw['Roll_Beta'] * daily_borrow
+    )
+
+    tw['DYN_Cum_Ret']      = (tw['DYN_Daily_PnL'].cumsum() / CAPITAL) * 100
+    tw['DYN_Peak_Ret']     = tw['DYN_Cum_Ret'].cummax()
+    tw['DYN_Drawdown_Pct'] = tw['DYN_Cum_Ret'] - tw['DYN_Peak_Ret']
+
+    # ── Metrics ───────────────────────────────────────────────────────
+    def _sharpe(pnl, scale):
+        s = pnl.iloc[1:]
+        e = (s / CAPITAL) - (RISK_FREE / TRADING_DAYS)
+        return (e.mean() / e.std()) * np.sqrt(scale) if e.std() != 0 else np.nan
+
+    days_in_market = (tw['Position'] != 0).sum()
+    beta_entry     = tw['Roll_Beta'].iloc[0]
+    beta_mean      = tw['Roll_Beta'].mean()
+    beta_min       = tw['Roll_Beta'].min()
+    beta_max       = tw['Roll_Beta'].max()
+
+    metrics_dyn = {
+        'Final Ret %':      tw['DYN_Cum_Ret'].iloc[-1],
+        'Max Drawdown %':   (tw['DYN_Cum_Ret'] - tw['DYN_Cum_Ret'].cummax()).min(),
+        'Sharpe (Period)':  _sharpe(tw['DYN_Daily_PnL'], len(tw) - 1),
+        'Sharpe (Annual)':  _sharpe(tw['DYN_Daily_PnL'], TRADING_DAYS),
+        'Win Rate':         (tw['DYN_Daily_PnL'][tw['Position'] != 0] > 0).mean() * 100
+                            if days_in_market > 0 else np.nan,
+        'Days in Market':   int(days_in_market),
+        'Long Signals':     int((tw['Position'] == 1).sum()),
+        'Short Signals':    int((tw['Position'] == -1).sum()),
+        'Beta Entry':       beta_entry,
+        'Beta Mean':        beta_mean,
+        'Beta Range':       f"{beta_min:.3f}–{beta_max:.3f}",
+        'ZScore Entry':     zscore_entry,
+        'ZScore Exit':      zscore_exit,
+    }
+
+    return tw, metrics_dyn
+
+
+def chart_dynamic_comparison(tw, metrics_static, metrics_dyn, case, case_key):
+    """
+    Chart 4 of 4: 3-panel comparison of static vs dynamic strategy.
+
+      Panel 1 — Cumulative return: static pairs vs dynamic momentum
+      Panel 2 — Position signal over time (+1 / 0 / -1)
+      Panel 3 — Drawdown comparison
+    """
+    if tw is None or metrics_dyn is None:
+        print(f"  [4/4] Skipped — dynamic backtest returned no data.")
+        return
+
+    dates      = tw['Date']
+    pct_fmt    = plt.FuncFormatter(lambda v, _: f'{v:.1f}%')
+    entry      = pd.to_datetime(case['entry_date'])
+
+    static_final = metrics_static['Final Ret %']
+    dyn_final    = metrics_dyn['Final Ret %']
+    dyn_sharpe   = metrics_dyn['Sharpe (Period)']
+    dyn_mdd      = metrics_dyn['Max Drawdown %']
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(14, 14),
+        gridspec_kw={'height_ratios': [3, 1.5, 1.5]},
+        sharex=True
+    )
+
+    # ── Panel 1: Return comparison ────────────────────────────────────
+    ax1 = axes[0]
+    ax1.plot(dates, tw['PAIR_Cum_Ret'], color='#1f77b4', linewidth=2,
+             linestyle='--', label=f"Static (thesis-fixed): {static_final:.2f}%",
+             alpha=0.7)
+    ax1.plot(dates, tw['DYN_Cum_Ret'], color='#2ca02c', linewidth=2.5,
+             label=f"Dynamic (momentum-following): {dyn_final:.2f}%")
+    ax1.axhline(0, color='black', linestyle='--', alpha=0.4)
+    ax1.fill_between(dates, tw['DYN_Cum_Ret'], 0,
+                     where=(tw['DYN_Cum_Ret'] >= 0),
+                     color='#2ca02c', alpha=0.10)
+    ax1.fill_between(dates, tw['DYN_Cum_Ret'], 0,
+                     where=(tw['DYN_Cum_Ret'] < 0),
+                     color='#d62728', alpha=0.10)
+    ax1.yaxis.set_major_formatter(pct_fmt)
+    ax1.set_title(
+        f"{case['title']}\n"
+        f"Static vs Dynamic Momentum Strategy  |  Rolling β (20-day)  "
+        f"|  Entry threshold: ±{metrics_dyn['ZScore Entry']}σ\n"
+        f"Dynamic — Final: {dyn_final:.2f}%  |  Sharpe: {dyn_sharpe:.2f}  "
+        f"|  Max DD: {dyn_mdd:.2f}%  "
+        f"|  β at entry: {metrics_dyn['Beta Entry']:.3f}  "
+        f"|  β mean: {metrics_dyn['Beta Mean']:.3f}  "
+        f"|  Days in market: {metrics_dyn['Days in Market']}",
+        fontweight='bold', pad=12
+    )
+    ax1.set_ylabel('Cumulative Return (%)')
+    ax1.legend(loc='upper left', fontsize=10)
+
+    trans = transforms.blended_transform_factory(ax1.transData, ax1.transAxes)
+    ax1.axvline(entry, color='black', linestyle='-.', linewidth=1.5, alpha=0.6)
+    ax1.text(entry, 0.95, '  Trade Window Opens', transform=trans,
+             rotation=90, va='top', ha='right',
+             fontsize=9, fontweight='bold', color='#333333')
+
+    # ── Panel 2: Position signal ──────────────────────────────────────
+    ax2 = axes[1]
+    long_ticker  = case['long_ticker']
+    short_ticker = case['short_ticker']
+
+    ax2.fill_between(dates, tw['Position'], 0,
+                     where=(tw['Position'] > 0),
+                     color='#2ca02c', alpha=0.5,
+                     label=f'Long {long_ticker} / Short {short_ticker}')
+    ax2.fill_between(dates, tw['Position'], 0,
+                     where=(tw['Position'] < 0),
+                     color='#d62728', alpha=0.5,
+                     label=f'Short {long_ticker} / Long {short_ticker} (inverted)')
+    ax2.axhline(0, color='black', linewidth=0.8, alpha=0.5)
+    ax2.set_yticks([-1, 0, 1])
+    ax2.set_yticklabels(['Inverted', 'Flat', 'Standard'])
+    ax2.set_title(
+        f"Position Signal  |  "
+        f"Standard: {metrics_dyn['Long Signals']} days  |  "
+        f"Inverted: {metrics_dyn['Short Signals']} days  |  "
+        f"Flat: {len(tw) - metrics_dyn['Days in Market']} days",
+        fontweight='bold', pad=8
+    )
+    ax2.set_ylabel('Position')
+    ax2.legend(loc='upper right', fontsize=9)
+
+    # ── Panel 3: Drawdown comparison ─────────────────────────────────
+    ax3 = axes[2]
+    static_dd = tw['PAIR_Drawdown_Pct']
+    ax3.plot(dates, static_dd, color='#1f77b4', linewidth=1.5,
+             linestyle='--', alpha=0.7,
+             label=f"Static DD (max: {metrics_static['Max Drawdown %']:.2f}%)")
+    ax3.fill_between(dates, tw['DYN_Drawdown_Pct'], 0,
+                     color='#d62728', alpha=0.35)
+    ax3.plot(dates, tw['DYN_Drawdown_Pct'], color='#d62728', linewidth=1.5,
+             label=f"Dynamic DD (max: {dyn_mdd:.2f}%)")
+    ax3.yaxis.set_major_formatter(pct_fmt)
+    ax3.axhline(0, color='black', linewidth=0.8, alpha=0.4)
+    ax3.set_title('Drawdown Comparison: Static vs Dynamic (%)',
+                  fontweight='bold', pad=8)
+    ax3.set_ylabel('Drawdown (%)')
+    ax3.legend(loc='lower left', fontsize=9)
+
+    ax3.xaxis.set_major_locator(mdates.MonthLocator())
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    plt.tight_layout(h_pad=2.5)
+    path = f"{OUTPUT_DIR}/{case_key}_4_dynamic_comparison.png"
+    plt.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  [4/4] Saved dynamic comparison  → {path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CROSS-CASE SUMMARY CHART
 # ══════════════════════════════════════════════════════════════════════════════
 
-def chart_cross_case_summary(all_metrics):
+def chart_cross_case_summary(all_metrics, all_metrics_dyn):
     """
-    Bar chart comparing Final PnL and Sharpe (Period) across all three
-    real-world cases. Intended as a single-slide summary for the presentation.
+    2×2 bar chart comparing Static vs Dynamic strategy across all cases.
+    Panels: Final Return, Sharpe, Max Drawdown, Days in Market.
     """
-    labels = list(all_metrics.keys())
-    pnls   = [all_metrics[k]['Final PnL']       for k in labels]
-    sharps = [all_metrics[k]['Sharpe (Period)']  for k in labels]
-    mdds   = [abs(all_metrics[k]['Max Drawdown']) for k in labels]
+    labels  = list(all_metrics.keys())
+    pct_fmt = plt.FuncFormatter(lambda v, _: f'{v:.1f}%')
+
+    stat_rets = [all_metrics[k]['Final Ret %']         for k in labels]
+    dyn_rets  = [all_metrics_dyn[k]['Final Ret %']     for k in labels if k in all_metrics_dyn]
+    stat_sh   = [all_metrics[k]['Sharpe (Period)']     for k in labels]
+    dyn_sh    = [all_metrics_dyn[k]['Sharpe (Period)'] for k in labels if k in all_metrics_dyn]
+    stat_mdd  = [abs(all_metrics[k]['Max Drawdown %'])      for k in labels]
+    dyn_mdd   = [abs(all_metrics_dyn[k]['Max Drawdown %'])  for k in labels if k in all_metrics_dyn]
+    dyn_dim   = [all_metrics_dyn[k]['Days in Market']  for k in labels if k in all_metrics_dyn]
 
     display_labels = {
-        'anadarko': 'Anadarko\nLong CVX / Short OXY\n(2019)',
-        'hulu':     'Hulu\nLong CMCSA / Short DIS\n(2023)',
-        'wwe':      'WWE\nLong FOXA / Short EDR\n(2023)',
-        'ksu':      'KSU Railway\nLong CNI / Short CP\n(2021)',
+        'anadarko': 'Anadarko\n(2019)',
+        'hulu':     'Hulu\n(2023)',
+        'ksu':      'KSU\n(2021)',
     }
     x_labels = [display_labels.get(k, k) for k in labels]
+    x        = np.arange(len(labels))
+    w        = 0.35
 
-    bar_colors = ['#2ca02c' if p >= 0 else '#d62728' for p in pnls]
+    fig, axes = plt.subplots(2, 2, figsize=(20, 12))
+    axes = axes.flatten()
 
-    fig, axes = plt.subplots(1, 3, figsize=(22, 7))
-
-    # Panel A — Final PnL
+    # Panel A — Final Return
     ax1 = axes[0]
-    bars = ax1.bar(x_labels, pnls, color=bar_colors, edgecolor='white',
-                   linewidth=1.5, width=0.5)
-    ax1.axhline(0, color='black', linewidth=1, alpha=0.5)
-    for bar, val in zip(bars, pnls):
-        ax1.text(bar.get_x() + bar.get_width() / 2,
-                 bar.get_height() + (max(pnls) * 0.02),
-                 f'${val:,.0f}',
-                 ha='center', va='bottom', fontsize=11, fontweight='bold')
-    ax1.set_title('Final PnL\n($100k notional, 50bps borrow)',
-                  fontweight='bold', pad=10)
-    ax1.set_ylabel('Cumulative P&L ($)')
-    ax1.tick_params(axis='x', labelsize=10)
+    b1 = ax1.bar(x - w/2, stat_rets, w, label='Static',  color='#1f77b4', alpha=0.85)
+    b2 = ax1.bar(x + w/2, dyn_rets,  w, label='Dynamic', color='#2ca02c', alpha=0.85)
+    ax1.axhline(0, color='black', linewidth=0.8, alpha=0.5)
+    ax1.yaxis.set_major_formatter(pct_fmt)
+    for bar, val in list(zip(b1, stat_rets)) + list(zip(b2, dyn_rets)):
+        ypos = bar.get_height() + (0.3 if bar.get_height() >= 0 else -1.2)
+        ax1.text(bar.get_x() + bar.get_width()/2, ypos,
+                 f'{val:.1f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    ax1.set_xticks(x); ax1.set_xticklabels(x_labels, fontsize=10)
+    ax1.set_title('Final Return (%)', fontweight='bold', pad=10)
+    ax1.set_ylabel('Cumulative Return (%)')
+    ax1.legend(fontsize=10)
 
-    # Panel B — Sharpe (Period)
+    # Panel B — Sharpe
     ax2 = axes[1]
-    sharpe_colors = ['#2ca02c' if s >= 0 else '#d62728' for s in sharps]
-    bars2 = ax2.bar(x_labels, sharps, color=sharpe_colors, edgecolor='white',
-                    linewidth=1.5, width=0.5)
-    ax2.axhline(0, color='black', linewidth=1, alpha=0.5)
-    ax2.axhline(1, color='gray', linewidth=1, linestyle='--', alpha=0.6,
-                label='Sharpe = 1.0')
-    for bar, val in zip(bars2, sharps):
-        ax2.text(bar.get_x() + bar.get_width() / 2,
-                 bar.get_height() + 0.03,
-                 f'{val:.2f}',
-                 ha='center', va='bottom', fontsize=11, fontweight='bold')
-    ax2.set_title('Sharpe Ratio (Period)\nscaled by √n actual days',
-                  fontweight='bold', pad=10)
+    b3 = ax2.bar(x - w/2, stat_sh, w, label='Static',  color='#1f77b4', alpha=0.85)
+    b4 = ax2.bar(x + w/2, dyn_sh,  w, label='Dynamic', color='#2ca02c', alpha=0.85)
+    ax2.axhline(0, color='black', linewidth=0.8, alpha=0.5)
+    ax2.axhline(1, color='gray',  linewidth=1, linestyle='--', alpha=0.6, label='Sharpe=1')
+    for bar, val in list(zip(b3, stat_sh)) + list(zip(b4, dyn_sh)):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                 f'{val:.2f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    ax2.set_xticks(x); ax2.set_xticklabels(x_labels, fontsize=10)
+    ax2.set_title('Sharpe Ratio (Period)', fontweight='bold', pad=10)
     ax2.set_ylabel('Sharpe Ratio')
     ax2.legend(fontsize=10)
-    ax2.tick_params(axis='x', labelsize=10)
 
-    # Panel C — Max Drawdown (shown as positive for readability)
+    # Panel C — Max Drawdown
     ax3 = axes[2]
-    bars3 = ax3.bar(x_labels, mdds, color='#ff7f0e', edgecolor='white',
-                    linewidth=1.5, width=0.5)
-    for bar, val in zip(bars3, mdds):
-        ax3.text(bar.get_x() + bar.get_width() / 2,
-                 bar.get_height() + (max(mdds) * 0.02),
-                 f'${val:,.0f}',
-                 ha='center', va='bottom', fontsize=11, fontweight='bold')
-    ax3.set_title('Max Drawdown\n(shown as positive)',
+    b5 = ax3.bar(x - w/2, stat_mdd, w, label='Static',  color='#1f77b4', alpha=0.85)
+    b6 = ax3.bar(x + w/2, dyn_mdd,  w, label='Dynamic', color='#2ca02c', alpha=0.85)
+    ax3.yaxis.set_major_formatter(pct_fmt)
+    all_mdd = stat_mdd + dyn_mdd
+    for bar, val in list(zip(b5, stat_mdd)) + list(zip(b6, dyn_mdd)):
+        ax3.text(bar.get_x() + bar.get_width()/2,
+                 bar.get_height() + (max(all_mdd) * 0.02),
+                 f'{val:.1f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    ax3.set_xticks(x); ax3.set_xticklabels(x_labels, fontsize=10)
+    ax3.set_title('Max Drawdown (%, positive)', fontweight='bold', pad=10)
+    ax3.set_ylabel('Max Drawdown (%)')
+    ax3.legend(fontsize=10)
+
+    # Panel D — Days in market (dynamic only)
+    ax4 = axes[3]
+    b7 = ax4.bar(x, dyn_dim, color='#9467bd', alpha=0.85, edgecolor='white')
+    for bar, val in zip(b7, dyn_dim):
+        ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                 str(val), ha='center', va='bottom', fontsize=10, fontweight='bold')
+    ax4.set_xticks(x); ax4.set_xticklabels(x_labels, fontsize=10)
+    ax4.set_title('Dynamic: Days in Market\n(out of total trade window)',
                   fontweight='bold', pad=10)
-    ax3.set_ylabel('Max Drawdown ($)')
-    ax3.tick_params(axis='x', labelsize=10)
+    ax4.set_ylabel('Trading Days')
 
     fig.suptitle(
-        "Winner's Curse Pairs Trade — Out-of-Sample Validation Summary\n"
-        "Long clean-balance-sheet bidder / Short levered winner  (β-Neutral, $100k notional)",
-        fontsize=14, fontweight='bold', y=1.02
+        "Winner's Curse Pairs Trade — Static vs Dynamic Momentum Strategy\n"
+        "Static: fixed Long/Short at catalyst  |  Dynamic: z-score momentum signal (±2σ)",
+        fontsize=14, fontweight='bold', y=1.01
     )
-
     plt.tight_layout()
-    path = f"{OUTPUT_DIR}/summary_cross_case_comparison.png"
+    path = f"{OUTPUT_DIR}/summary_static_vs_dynamic.png"
     plt.savefig(path, dpi=300, bbox_inches='tight')
     plt.close(fig)
-    print(f"\n  Saved cross-case summary chart → {path}")
+    print(f"\n  Saved static vs dynamic summary → {path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -562,7 +825,8 @@ def main():
     setup_style()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    all_metrics = {}
+    all_metrics     = {}
+    all_metrics_dyn = {}
 
     for case_key, case in CASES.items():
         print(f"\n{'═'*60}")
@@ -577,62 +841,91 @@ def main():
             case['fetch_end'],
         )
 
-        # 2. Run backtest
+        # 2. Run static backtest
         tw, metrics = run_backtest(df, case['entry_date'])
 
         if metrics:
             all_metrics[case_key] = metrics
-            print(f"\n  Pairs Trade results:")
-            print(f"    Final PnL:       ${metrics['Final PnL']:>10,.2f}")
+            print(f"\n  [Static] Pairs Trade results:")
+            print(f"    Final Return:    {metrics['Final Ret %']:>10.2f}%")
             print(f"    Sharpe (Period):  {metrics['Sharpe (Period)']:>10.3f}")
             print(f"    Sharpe (Annual):  {metrics['Sharpe (Annual)']:>10.3f}")
-            print(f"    Max Drawdown:    ${metrics['Max Drawdown']:>10,.2f}")
+            print(f"    Max Drawdown:    {metrics['Max Drawdown %']:>10.2f}%")
             print(f"    Win Rate:         {metrics['Win Rate']:>9.1f}%")
-            print(f"\n  Hedge Ratio (β) over trade window:")
-            print(f"    Entry β:          {metrics['Beta Entry']:>10.4f}")
-            print(f"    Exit β:           {metrics['Beta Exit']:>10.4f}")
-            print(f"    Mean β:           {metrics['Beta Mean']:>10.4f}")
-            print(f"    Min β:            {metrics['Beta Min']:>10.4f}")
-            print(f"    Max β:            {metrics['Beta Max']:>10.4f}")
-            print(f"    Std β:            {metrics['Beta Std']:>10.4f}")
+            print(f"    Constant β:       {metrics['Const Beta']:>10.4f}  "
+                  f"(OLS on {metrics['Pre-Entry Days']} pre-entry days)")
 
-        # 3. Generate the three charts
+        # 3. Run dynamic backtest
+        tw_dyn, metrics_dyn = run_dynamic_backtest(df, case['entry_date'])
+
+        if metrics_dyn:
+            all_metrics_dyn[case_key] = metrics_dyn
+            print(f"\n  [Dynamic] Momentum strategy results (rolling β):")
+            print(f"    Final Return:    {metrics_dyn['Final Ret %']:>10.2f}%")
+            print(f"    Sharpe (Period):  {metrics_dyn['Sharpe (Period)']:>10.3f}")
+            print(f"    Sharpe (Annual):  {metrics_dyn['Sharpe (Annual)']:>10.3f}")
+            print(f"    Max Drawdown:    {metrics_dyn['Max Drawdown %']:>10.2f}%")
+            print(f"    Win Rate:         {metrics_dyn['Win Rate']:>9.1f}%")
+            print(f"    β at entry:       {metrics_dyn['Beta Entry']:>10.4f}  "
+                  f"range: {metrics_dyn['Beta Range']}  "
+                  f"mean: {metrics_dyn['Beta Mean']:.4f}")
+            print(f"    Days in Market:   {metrics_dyn['Days in Market']:>9}  "
+                  f"({metrics_dyn['Long Signals']} standard / "
+                  f"{metrics_dyn['Short Signals']} inverted)")
+
+        # 4. Generate all four charts
         print(f"\n  Generating charts...")
         chart_normalized_returns(df, case, case_key)
         chart_spread_zscore(df, case, case_key)
         chart_backtest_pnl(df, tw, metrics, case, case_key)
+        # Pass tw with dynamic columns merged in (tw already has PAIR_Cum_Ret
+        # from static backtest; we merge dynamic columns onto it)
+        if tw is not None and tw_dyn is not None:
+            tw['DYN_Daily_PnL']   = tw_dyn['DYN_Daily_PnL'].values
+            tw['DYN_Cum_Ret']     = tw_dyn['DYN_Cum_Ret'].values
+            tw['DYN_Drawdown_Pct']= tw_dyn['DYN_Drawdown_Pct'].values
+            tw['Position']        = tw_dyn['Position'].values
+            chart_dynamic_comparison(tw, metrics, metrics_dyn, case, case_key)
 
-    # 4. Cross-case summary (only if we have results for all cases)
-    if len(all_metrics) == len(CASES):
-        chart_cross_case_summary(all_metrics)
+    # 5. Cross-case summary
+    if len(all_metrics) == len(CASES) and len(all_metrics_dyn) == len(CASES):
+        chart_cross_case_summary(all_metrics, all_metrics_dyn)
 
-    # 5. Final summary table
-    print(f"\n{'═'*60}")
-    print(f"  FINAL CROSS-CASE SUMMARY (β-Neutral Pairs Trade)")
-    print(f"{'═'*60}")
-    print(f"  {'Case':<44} {'PnL':>10} {'Sharpe(P)':>10} {'Max DD':>10} {'Win%':>8}")
-    print(f"  {'-'*82}")
+    # 6. Final summary table
+    print(f"\n{'═'*70}")
+    print(f"  FINAL CROSS-CASE SUMMARY")
+    print(f"{'═'*70}")
+    print(f"  {'Case':<36} {'Strategy':<10} {'Return':>8} {'Sharpe':>8} {'Max DD':>8} {'Win%':>7}")
+    print(f"  {'-'*77}")
     labels_display = {
-        'anadarko': 'Anadarko 2019 — Long CVX  / Short OXY ',
-        'hulu':     'Hulu     2023 — Long CMCSA / Short DIS ',
-        'wwe':      'WWE      2023 — Long FOXA  / Short EDR ',
-        'ksu':      'KSU      2021 — Long CNI   / Short CP  ',
+        'anadarko': 'Anadarko 2019 — CVX / OXY',
+        'hulu':     'Hulu     2023 — CMCSA / DIS',
+        'ksu':      'KSU      2021 — CNI / CP  ',
     }
     for k, lbl in labels_display.items():
         if k in all_metrics:
-            m = all_metrics[k]
-            print(f"  {lbl:<44} "
-                  f"${m['Final PnL']:>8,.0f}  "
-                  f"{m['Sharpe (Period)']:>9.2f}  "
-                  f"${m['Max Drawdown']:>8,.0f}  "
-                  f"{m['Win Rate']:>6.1f}%")
+            m  = all_metrics[k]
+            md = all_metrics_dyn.get(k, {})
+            print(f"  {lbl:<36} {'Static':<10} "
+                  f"{m['Final Ret %']:>7.2f}%  "
+                  f"{m['Sharpe (Period)']:>7.2f}  "
+                  f"{m['Max Drawdown %']:>7.2f}%  "
+                  f"{m['Win Rate']:>5.1f}%")
+            if md:
+                print(f"  {'':36} {'Dynamic':<10} "
+                      f"{md['Final Ret %']:>7.2f}%  "
+                      f"{md['Sharpe (Period)']:>7.2f}  "
+                      f"{md['Max Drawdown %']:>7.2f}%  "
+                      f"{md['Win Rate']:>5.1f}%")
+            print(f"  {'-'*77}")
 
     print(f"\n  All charts saved to '{OUTPUT_DIR}/'")
     print(f"  Files generated per case:")
     print(f"    <case>_1_normalized_returns.png")
     print(f"    <case>_2_spread_zscore.png")
-    print(f"    <case>_3_backtest_pnl.png")
-    print(f"    summary_cross_case_comparison.png")
+    print(f"    <case>_3_backtest_pnl.png        (static strategy)")
+    print(f"    <case>_4_dynamic_comparison.png  (static vs dynamic)")
+    print(f"    summary_static_vs_dynamic.png    (cross-case 2×2 summary)")
 
 
 if __name__ == '__main__':

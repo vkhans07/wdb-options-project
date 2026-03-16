@@ -214,7 +214,11 @@ def backtest_winners_curse_pairs_trade(df):
     Executes exactly when Netflix exits the deal (2026-02-26).
 
     Key design decisions:
-    - Hedge ratio computed via shared compute_hedge_ratio(), lagged 1 day.
+    - Constant hedge ratio estimated via OLS on the pre-entry window
+      (all data before 2026-02-26). Locked in at entry, never rebalanced.
+      This is correct for an event-driven trade with a single catalyst
+      entry — rolling beta would implicitly resize the position daily,
+      adding unmodelled transaction costs and noise.
     - ALL three PnL series use the same daily-return method for consistency.
     - Day 1 return is 0 by construction (entry day, no prior close).
     - Borrow cost applied to the short PSKY leg at 50 bps annualised.
@@ -237,16 +241,28 @@ def backtest_winners_curse_pairs_trade(df):
     n_days = len(trade_window)
 
     # ------------------------------------------------------------------ #
-    # 2. HEDGE RATIO — from shared function, already lagged 1 day        #
+    # 2. HEDGE RATIO — constant beta estimated on pre-entry window only  #
+    #                                                                     #
+    #    β = Cov(NFLX_ret, PSKY_ret) / Var(PSKY_ret)                     #
+    #    Computed once on all data before Feb 26 and locked in for the   #
+    #    entire trade. No rebalancing, no look-ahead bias.                #
     # ------------------------------------------------------------------ #
-    hedge_series = compute_hedge_ratio(df, window=20)
-    hedge_map    = dict(zip(df['Date'], hedge_series))
-    trade_window['Hedge_Ratio'] = trade_window['Date'].map(hedge_map).fillna(1.0)
+    pre_entry     = df[df['Date'] < trade_start].copy()
+    pre_nflx_ret  = pre_entry['NFLX'].pct_change().dropna()
+    pre_psky_ret  = pre_entry['PSKY'].pct_change().dropna()
+    aligned       = pd.concat([pre_nflx_ret, pre_psky_ret], axis=1).dropna()
+    aligned.columns = ['N', 'P']
+
+    if len(aligned) >= 2:
+        const_beta = aligned['N'].cov(aligned['P']) / aligned['P'].var()
+    else:
+        const_beta = 1.0
+        print("  ⚠  Insufficient pre-entry data — defaulting β = 1.0")
 
     print(f"\nNFLX entry price:          ${trade_window['NFLX'].iloc[0]:.2f}")
     print(f"PSKY entry price:          ${trade_window['PSKY'].iloc[0]:.2f}")
-    print(f"Opening Hedge Ratio (β):   {trade_window['Hedge_Ratio'].iloc[0]:.4f}")
-    print(f"Closing Hedge Ratio (β):   {trade_window['Hedge_Ratio'].iloc[-1]:.4f}")
+    print(f"Constant Hedge Ratio (β):  {const_beta:.4f}  "
+          f"(OLS on {len(aligned)} pre-entry days)")
     print(f"Trade window:              {n_days} trading days\n")
 
     # ------------------------------------------------------------------ #
@@ -273,37 +289,33 @@ def backtest_winners_curse_pairs_trade(df):
     # Short PSKY: gains when PSKY falls; borrow cost is a daily drag
     trade_window['PSKY_Daily_PnL'] = (
         -CAPITAL * trade_window['PSKY_Ret']
-        - CAPITAL * daily_borrow  # borrow cost reduces PnL every day
+        - CAPITAL * daily_borrow
     )
 
     trade_window['Pair_Daily_PnL'] = (
           CAPITAL * trade_window['NFLX_Ret']
-        - CAPITAL * trade_window['Hedge_Ratio'] * trade_window['PSKY_Ret']
-        - CAPITAL * trade_window['Hedge_Ratio'] * daily_borrow  # scaled borrow
+        - CAPITAL * const_beta * trade_window['PSKY_Ret']
+        - CAPITAL * const_beta * daily_borrow
     )
 
     # ------------------------------------------------------------------ #
-    # 6. CUMULATIVE P&L                                                   #
+    # 6. CUMULATIVE P&L — expressed as % return on capital               #
     # ------------------------------------------------------------------ #
-    trade_window['NFLX_Cum_PnL'] = trade_window['NFLX_Daily_PnL'].cumsum()
-    trade_window['PSKY_Cum_PnL'] = trade_window['PSKY_Daily_PnL'].cumsum()
-    trade_window['Pair_Cum_PnL'] = trade_window['Pair_Daily_PnL'].cumsum()
+    trade_window['NFLX_Cum_Ret'] = (trade_window['NFLX_Daily_PnL'].cumsum() / CAPITAL) * 100
+    trade_window['PSKY_Cum_Ret'] = (trade_window['PSKY_Daily_PnL'].cumsum() / CAPITAL) * 100
+    trade_window['Pair_Cum_Ret'] = (trade_window['Pair_Daily_PnL'].cumsum() / CAPITAL) * 100
 
     # ------------------------------------------------------------------ #
-    # 7. DRAWDOWN                                                         #
+    # 7. DRAWDOWN — expressed as % drawdown on capital                   #
     # ------------------------------------------------------------------ #
-    trade_window['Pair_Peak']     = trade_window['Pair_Cum_PnL'].cummax()
-    trade_window['Pair_Drawdown'] = trade_window['Pair_Cum_PnL'] - trade_window['Pair_Peak']
+    trade_window['Pair_Peak_Ret']     = trade_window['Pair_Cum_Ret'].cummax()
+    trade_window['Pair_Drawdown_Pct'] = trade_window['Pair_Cum_Ret'] - trade_window['Pair_Peak_Ret']
 
     # ------------------------------------------------------------------ #
     # 8. PERFORMANCE METRICS                                              #
     # ------------------------------------------------------------------ #
 
     def realised_sharpe(daily_pnl_series, capital, rf_annual, tdays):
-        """
-        Period Sharpe scaled by sqrt(n_actual).
-        Drops entry day (return = 0 by construction) to avoid suppressing variance.
-        """
         pnl   = daily_pnl_series.iloc[1:]
         n     = len(pnl)
         ret   = pnl / capital
@@ -314,10 +326,6 @@ def backtest_winners_curse_pairs_trade(df):
         return (exc.mean() / exc.std()) * np.sqrt(n)
 
     def annualised_sharpe(daily_pnl_series, capital, rf_annual, tdays):
-        """
-        Standard annualised Sharpe scaled by sqrt(252).
-        Allows like-for-like comparison with published benchmarks.
-        """
         pnl   = daily_pnl_series.iloc[1:]
         ret   = pnl / capital
         rf_d  = rf_annual / tdays
@@ -326,26 +334,25 @@ def backtest_winners_curse_pairs_trade(df):
             return np.nan
         return (exc.mean() / exc.std()) * np.sqrt(tdays)
 
-    def max_drawdown_dollars(cum_pnl_series):
-        peak = cum_pnl_series.cummax()
-        return (cum_pnl_series - peak).min()
+    def max_drawdown_pct(cum_ret_series):
+        """Peak-to-trough drawdown as a percentage of capital."""
+        peak = cum_ret_series.cummax()
+        return (cum_ret_series - peak).min()
 
     def win_rate_pct(daily_pnl_series):
         return (daily_pnl_series > 0).mean() * 100
 
     strategies = {
-        'Long NFLX Only':          'NFLX',
-        'Short PSKY Only':         'PSKY',
-        'Pairs Trade (β-Neutral)': 'Pair',
+        'Long NFLX Only':          ('NFLX_Daily_PnL', 'NFLX_Cum_Ret'),
+        'Short PSKY Only':         ('PSKY_Daily_PnL', 'PSKY_Cum_Ret'),
+        'Pairs Trade (β-Neutral)': ('Pair_Daily_PnL', 'Pair_Cum_Ret'),
     }
 
     metrics = {}
-    for label, prefix in strategies.items():
-        pnl_col          = f'{prefix}_Daily_PnL'
-        cum_col          = f'{prefix}_Cum_PnL'
-        metrics[label]   = {
-            'Final PnL':       trade_window[cum_col].iloc[-1],
-            'Max Drawdown':    max_drawdown_dollars(trade_window[cum_col]),
+    for label, (pnl_col, ret_col) in strategies.items():
+        metrics[label] = {
+            'Final Ret %':     trade_window[ret_col].iloc[-1],
+            'Max Drawdown %':  max_drawdown_pct(trade_window[ret_col]),
             'Sharpe (Period)': realised_sharpe(trade_window[pnl_col], CAPITAL, RISK_FREE, TRADING_DAYS),
             'Sharpe (Annual)': annualised_sharpe(trade_window[pnl_col], CAPITAL, RISK_FREE, TRADING_DAYS),
             'Win Rate':        win_rate_pct(trade_window[pnl_col]),
@@ -366,11 +373,11 @@ def backtest_winners_curse_pairs_trade(df):
     print(divider)
 
     rows = [
-        ('Final Net PnL',         'Final PnL',       lambda v: f"${v:>10,.2f}"),
-        ('Max Drawdown',          'Max Drawdown',     lambda v: f"${v:>10,.2f}"),
-        ('Sharpe (Period)',        'Sharpe (Period)',  lambda v: f"{v:>12.3f}"),
-        ('Sharpe (Annualised)',    'Sharpe (Annual)',  lambda v: f"{v:>12.3f}"),
-        ('Daily Win Rate',         'Win Rate',         lambda v: f"{v:>11.1f}%"),
+        ('Final Return',          'Final Ret %',     lambda v: f"{v:>10.2f}%"),
+        ('Max Drawdown',          'Max Drawdown %',  lambda v: f"{v:>10.2f}%"),
+        ('Sharpe (Period)',        'Sharpe (Period)', lambda v: f"{v:>12.3f}"),
+        ('Sharpe (Annualised)',    'Sharpe (Annual)', lambda v: f"{v:>12.3f}"),
+        ('Daily Win Rate',        'Win Rate',         lambda v: f"{v:>11.1f}%"),
     ]
     for display, key, fmt in rows:
         print(f"{display:<{lbl_w}}"
@@ -380,13 +387,14 @@ def backtest_winners_curse_pairs_trade(df):
     print(f"\nStarting Capital:   ${CAPITAL:>10,.2f}")
     print(f"Risk-Free Rate:      {RISK_FREE*100:.1f}% p.a.")
     print(f"Short Borrow Cost:   {BORROW_COST*100:.0f} bps p.a. (applied to short PSKY leg)")
+    print(f"Constant β:          {const_beta:.4f}  (OLS on pre-entry window)")
     print(f"Trade Entry:         {trade_window['Date'].iloc[0].strftime('%Y-%m-%d')}")
     print(f"Trade Exit:          {trade_window['Date'].iloc[-1].strftime('%Y-%m-%d')}")
     print(f"\nNOTE: 'Sharpe (Period)' scales by √n_actual — honest for short windows.")
     print(f"      'Sharpe (Annual)' scales by √252 — use for benchmark comparisons.")
 
     # ------------------------------------------------------------------ #
-    # 10. 3-PANEL CHART (existing)                                        #
+    # 10. 3-PANEL CHART                                                   #
     # ------------------------------------------------------------------ #
     os.makedirs('charts', exist_ok=True)
     fig, axes = plt.subplots(
@@ -396,31 +404,33 @@ def backtest_winners_curse_pairs_trade(df):
         sharex=True
     )
 
-    dates       = trade_window['Date']
-    pair_final  = metrics['Pairs Trade (β-Neutral)']['Final PnL']
-    pair_sharpe = metrics['Pairs Trade (β-Neutral)']['Sharpe (Period)']
-    pair_mdd    = metrics['Pairs Trade (β-Neutral)']['Max Drawdown']
+    dates        = trade_window['Date']
+    pair_final   = metrics['Pairs Trade (β-Neutral)']['Final Ret %']
+    pair_sharpe  = metrics['Pairs Trade (β-Neutral)']['Sharpe (Period)']
+    pair_mdd     = metrics['Pairs Trade (β-Neutral)']['Max Drawdown %']
 
     # ── Panel 1: Pairs strategy ──────────────────────────────────────
     ax1 = axes[0]
-    ax1.plot(dates, trade_window['Pair_Cum_PnL'],
+    ax1.plot(dates, trade_window['Pair_Cum_Ret'],
              color='#2ca02c', linewidth=2.5,
              label='Long NFLX / Short PSKY (β-Neutral, after borrow cost)')
     ax1.axhline(0, color='black', linestyle='--', alpha=0.4)
-    ax1.fill_between(dates, trade_window['Pair_Cum_PnL'], 0,
-                     where=(trade_window['Pair_Cum_PnL'] >= 0),
+    ax1.fill_between(dates, trade_window['Pair_Cum_Ret'], 0,
+                     where=(trade_window['Pair_Cum_Ret'] >= 0),
                      color='#2ca02c', alpha=0.12, label='Profit Zone')
-    ax1.fill_between(dates, trade_window['Pair_Cum_PnL'], 0,
-                     where=(trade_window['Pair_Cum_PnL'] < 0),
+    ax1.fill_between(dates, trade_window['Pair_Cum_Ret'], 0,
+                     where=(trade_window['Pair_Cum_Ret'] < 0),
                      color='#d62728', alpha=0.12, label='Loss Zone')
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.1f}%'))
     ax1.set_title(
-        "Pairs Trade Cumulative P&L: Long NFLX / Short PSKY (β-Neutral)\n"
-        f"Final PnL: ${pair_final:,.0f}  |  "
+        "Pairs Trade Cumulative Return: Long NFLX / Short PSKY (β-Neutral)\n"
+        f"Constant β = {const_beta:.4f}  |  "
+        f"Final Return: {pair_final:.2f}%  |  "
         f"Sharpe (Period): {pair_sharpe:.2f}  |  "
-        f"Max DD: ${pair_mdd:,.0f}  |  Borrow Cost: 50 bps",
+        f"Max DD: {pair_mdd:.2f}%  |  Borrow Cost: 50 bps",
         fontweight='bold', pad=12
     )
-    ax1.set_ylabel("Cumulative P&L ($)")
+    ax1.set_ylabel("Cumulative Return (%)")
     ax1.legend(loc='upper left', fontsize=10)
 
     trans = transforms.blended_transform_factory(ax1.transData, ax1.transAxes)
@@ -431,32 +441,34 @@ def backtest_winners_curse_pairs_trade(df):
 
     # ── Panel 2: All three legs ──────────────────────────────────────
     ax2 = axes[1]
-    ax2.plot(dates, trade_window['NFLX_Cum_PnL'],
+    ax2.plot(dates, trade_window['NFLX_Cum_Ret'],
              color='#d62728', linewidth=2, linestyle='--',
-             label=f"Long NFLX Only  (${metrics['Long NFLX Only']['Final PnL']:,.0f})")
-    ax2.plot(dates, trade_window['PSKY_Cum_PnL'],
+             label=f"Long NFLX Only  ({metrics['Long NFLX Only']['Final Ret %']:.2f}%)")
+    ax2.plot(dates, trade_window['PSKY_Cum_Ret'],
              color='#ff7f0e', linewidth=2, linestyle='--',
-             label=f"Short PSKY Only (${metrics['Short PSKY Only']['Final PnL']:,.0f})")
-    ax2.plot(dates, trade_window['Pair_Cum_PnL'],
+             label=f"Short PSKY Only ({metrics['Short PSKY Only']['Final Ret %']:.2f}%)")
+    ax2.plot(dates, trade_window['Pair_Cum_Ret'],
              color='#2ca02c', linewidth=2.5,
-             label=f"Pairs Trade β-Neutral (${pair_final:,.0f})")
+             label=f"Pairs Trade β={const_beta:.3f} ({pair_final:.2f}%)")
     ax2.axhline(0, color='black', linestyle='--', alpha=0.4)
+    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.1f}%'))
     ax2.set_title("Individual Leg Benchmarks vs. Pairs Strategy",
                   fontweight='bold', pad=8)
-    ax2.set_ylabel("Cumulative P&L ($)")
+    ax2.set_ylabel("Cumulative Return (%)")
     ax2.legend(loc='upper left', fontsize=10)
 
     # ── Panel 3: Drawdown ────────────────────────────────────────────
     ax3 = axes[2]
-    ax3.fill_between(dates, trade_window['Pair_Drawdown'], 0,
+    ax3.fill_between(dates, trade_window['Pair_Drawdown_Pct'], 0,
                      color='#d62728', alpha=0.4)
-    ax3.plot(dates, trade_window['Pair_Drawdown'],
+    ax3.plot(dates, trade_window['Pair_Drawdown_Pct'],
              color='#d62728', linewidth=1.5, label='Drawdown')
     ax3.axhline(pair_mdd, color='darkred', linestyle=':',
                 linewidth=1.5,
-                label=f"Max Drawdown: ${pair_mdd:,.0f}")
-    ax3.set_title("Pairs Strategy Drawdown", fontweight='bold', pad=8)
-    ax3.set_ylabel("Drawdown ($)")
+                label=f"Max Drawdown: {pair_mdd:.2f}%")
+    ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.1f}%'))
+    ax3.set_title("Pairs Strategy Drawdown (%)", fontweight='bold', pad=8)
+    ax3.set_ylabel("Drawdown (%)")
     ax3.legend(loc='lower left', fontsize=10)
 
     ax3.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO))
@@ -727,8 +739,8 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
     DataFrame (output of fetch_merger_data).
 
     Methodology is identical to backtest_winners_curse_pairs_trade():
-      - Hedge ratio = rolling Cov(LONG_ret, SHORT_ret) / Var(SHORT_ret),
-        lagged 1 day to eliminate look-ahead bias
+      - Constant hedge ratio estimated via OLS on the pre-entry window only.
+        β = Cov(LONG_ret, SHORT_ret) / Var(SHORT_ret), locked in at entry.
       - Long leg: +capital × LONG daily return
       - Short leg: -capital × β × SHORT daily return − borrow cost drag
       - Reports period Sharpe, annualised Sharpe, max drawdown, win rate
@@ -773,14 +785,24 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
         print("  ⚠  Insufficient pre-entry data for cointegration test.")
 
     # ------------------------------------------------------------------ #
-    # 2. HEDGE RATIO — rolling beta, lagged 1 day                        #
+    # 2. HEDGE RATIO — constant beta estimated on pre-entry window only  #
+    #                                                                     #
+    #    β = Cov(LONG_ret, SHORT_ret) / Var(SHORT_ret)                   #
+    #    Computed once on all data before entry date and locked in for   #
+    #    the entire trade. No rebalancing, no look-ahead bias.            #
     # ------------------------------------------------------------------ #
     df = df.copy()
-    df['LONG_Ret']    = df['LONG'].pct_change()
-    df['SHORT_Ret']   = df['SHORT'].pct_change()
-    roll_cov          = df['LONG_Ret'].rolling(hedge_window).cov(df['SHORT_Ret'])
-    roll_var          = df['SHORT_Ret'].rolling(hedge_window).var()
-    df['Hedge_Ratio'] = (roll_cov / roll_var).shift(1).fillna(1.0)
+    pre          = df[df['Date'] < entry].copy()
+    pre_long_ret = pre['LONG'].pct_change().dropna()
+    pre_short_ret= pre['SHORT'].pct_change().dropna()
+    aligned      = pd.concat([pre_long_ret, pre_short_ret], axis=1).dropna()
+    aligned.columns = ['L', 'S']
+
+    if len(aligned) >= 2:
+        const_beta = aligned['L'].cov(aligned['S']) / aligned['S'].var()
+    else:
+        const_beta = 1.0
+        print("  ⚠  Insufficient pre-entry data — defaulting β = 1.0")
 
     # ------------------------------------------------------------------ #
     # 3. ISOLATE TRADE WINDOW                                             #
@@ -793,7 +815,8 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
 
     print(f"\n  {long_label} entry price:  ${tw['LONG'].iloc[0]:.2f}")
     print(f"  {short_label} entry price: ${tw['SHORT'].iloc[0]:.2f}")
-    print(f"  Opening β:              {tw['Hedge_Ratio'].iloc[0]:.4f}")
+    print(f"  Constant β:             {const_beta:.4f}  "
+          f"(OLS on {len(aligned)} pre-entry days)")
     print(f"  Trade window:           {len(tw)} trading days")
 
     # ------------------------------------------------------------------ #
@@ -813,48 +836,47 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
     )
     tw['PAIR_Daily_PnL']  = (
           capital * tw['LONG_Ret']
-        - capital * tw['Hedge_Ratio'] * tw['SHORT_Ret']
-        - capital * tw['Hedge_Ratio'] * daily_borrow
+        - capital * const_beta * tw['SHORT_Ret']
+        - capital * const_beta * daily_borrow
     )
 
     # ------------------------------------------------------------------ #
-    # 6. CUMULATIVE P&L + DRAWDOWN                                        #
+    # 6. CUMULATIVE RETURN + DRAWDOWN — expressed as % of capital        #
     # ------------------------------------------------------------------ #
-    tw['LONG_Cum_PnL']  = tw['LONG_Daily_PnL'].cumsum()
-    tw['SHORT_Cum_PnL'] = tw['SHORT_Daily_PnL'].cumsum()
-    tw['PAIR_Cum_PnL']  = tw['PAIR_Daily_PnL'].cumsum()
-    tw['PAIR_Peak']     = tw['PAIR_Cum_PnL'].cummax()
-    tw['PAIR_Drawdown'] = tw['PAIR_Cum_PnL'] - tw['PAIR_Peak']
+    tw['LONG_Cum_Ret']  = (tw['LONG_Daily_PnL'].cumsum() / capital) * 100
+    tw['SHORT_Cum_Ret'] = (tw['SHORT_Daily_PnL'].cumsum() / capital) * 100
+    tw['PAIR_Cum_Ret']  = (tw['PAIR_Daily_PnL'].cumsum() / capital) * 100
+    tw['PAIR_Peak_Ret']     = tw['PAIR_Cum_Ret'].cummax()
+    tw['PAIR_Drawdown_Pct'] = tw['PAIR_Cum_Ret'] - tw['PAIR_Peak_Ret']
 
     # ------------------------------------------------------------------ #
     # 7. METRICS                                                          #
     # ------------------------------------------------------------------ #
     def _sharpe(pnl, scale):
         s = pnl.iloc[1:]
-        r = s / capital
-        e = r - (risk_free / trading_days)
+        e = (s / capital) - (risk_free / trading_days)
         return (e.mean() / e.std()) * np.sqrt(scale) if e.std() != 0 else np.nan
 
-    def _mdd(cum):
-        return (cum - cum.cummax()).min()
+    def _mdd_pct(cum_ret):
+        return (cum_ret - cum_ret.cummax()).min()
 
     def _wr(pnl):
         return (pnl > 0).mean() * 100
 
     legs = {
-        f'Long {long_label} Only':   'LONG',
-        f'Short {short_label} Only': 'SHORT',
-        'Pairs Trade (β-Neutral)':   'PAIR',
+        f'Long {long_label} Only':   ('LONG_Daily_PnL', 'LONG_Cum_Ret'),
+        f'Short {short_label} Only': ('SHORT_Daily_PnL', 'SHORT_Cum_Ret'),
+        'Pairs Trade (β-Neutral)':   ('PAIR_Daily_PnL', 'PAIR_Cum_Ret'),
     }
 
     metrics = {}
-    for label, p in legs.items():
+    for label, (pnl_col, ret_col) in legs.items():
         metrics[label] = {
-            'Final PnL':       tw[f'{p}_Cum_PnL'].iloc[-1],
-            'Max Drawdown':    _mdd(tw[f'{p}_Cum_PnL']),
-            'Sharpe (Period)': _sharpe(tw[f'{p}_Daily_PnL'], len(tw) - 1),
-            'Sharpe (Annual)': _sharpe(tw[f'{p}_Daily_PnL'], trading_days),
-            'Win Rate':        _wr(tw[f'{p}_Daily_PnL']),
+            'Final Ret %':    tw[ret_col].iloc[-1],
+            'Max Drawdown %': _mdd_pct(tw[ret_col]),
+            'Sharpe (Period)': _sharpe(tw[pnl_col], len(tw) - 1),
+            'Sharpe (Annual)': _sharpe(tw[pnl_col], trading_days),
+            'Win Rate':        _wr(tw[pnl_col]),
         }
 
     # ------------------------------------------------------------------ #
@@ -870,8 +892,8 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
     print(div)
 
     rows = [
-        ('Final Net PnL',      'Final PnL',       lambda v: f"${v:>10,.2f}"),
-        ('Max Drawdown',       'Max Drawdown',    lambda v: f"${v:>10,.2f}"),
+        ('Final Return',       'Final Ret %',     lambda v: f"{v:>10.2f}%"),
+        ('Max Drawdown',       'Max Drawdown %',  lambda v: f"{v:>10.2f}%"),
         ('Sharpe (Period)',     'Sharpe (Period)', lambda v: f"{v:>12.3f}"),
         ('Sharpe (Annualised)', 'Sharpe (Annual)', lambda v: f"{v:>12.3f}"),
         ('Daily Win Rate',     'Win Rate',        lambda v: f"{v:>11.1f}%"),
@@ -881,6 +903,7 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
               + "".join(f"{fmt(metrics[c][key]):>{col_w}}" for c in cols))
     print(div)
     print(f"\n  Capital: ${capital:,.0f}  |  Borrow: {borrow_cost*100:.0f}bps  "
+          f"|  Constant β: {const_beta:.4f}  "
           f"|  Entry: {tw['Date'].iloc[0].date()}  "
           f"|  Exit: {tw['Date'].iloc[-1].date()}")
 
@@ -888,9 +911,9 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
     # 9. 3-PANEL CHART                                                    #
     # ------------------------------------------------------------------ #
     pair_key    = 'Pairs Trade (β-Neutral)'
-    pair_final  = metrics[pair_key]['Final PnL']
+    pair_final  = metrics[pair_key]['Final Ret %']
     pair_sharpe = metrics[pair_key]['Sharpe (Period)']
-    pair_mdd    = metrics[pair_key]['Max Drawdown']
+    pair_mdd    = metrics[pair_key]['Max Drawdown %']
     dates       = tw['Date']
 
     fig, axes = plt.subplots(
@@ -899,24 +922,26 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
         sharex=True
     )
 
-    # Panel 1 — Pairs PnL
+    # Panel 1 — Pairs return
     ax1 = axes[0]
-    ax1.plot(dates, tw['PAIR_Cum_PnL'], color='#2ca02c', linewidth=2.5,
+    ax1.plot(dates, tw['PAIR_Cum_Ret'], color='#2ca02c', linewidth=2.5,
              label=f'Long {long_label} / Short {short_label} (β-Neutral)')
     ax1.axhline(0, color='black', linestyle='--', alpha=0.4)
-    ax1.fill_between(dates, tw['PAIR_Cum_PnL'], 0,
-                     where=(tw['PAIR_Cum_PnL'] >= 0),
+    ax1.fill_between(dates, tw['PAIR_Cum_Ret'], 0,
+                     where=(tw['PAIR_Cum_Ret'] >= 0),
                      color='#2ca02c', alpha=0.12, label='Profit Zone')
-    ax1.fill_between(dates, tw['PAIR_Cum_PnL'], 0,
-                     where=(tw['PAIR_Cum_PnL'] < 0),
+    ax1.fill_between(dates, tw['PAIR_Cum_Ret'], 0,
+                     where=(tw['PAIR_Cum_Ret'] < 0),
                      color='#d62728', alpha=0.12, label='Loss Zone')
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.1f}%'))
     ax1.set_title(
-        f"{case_label}\nPairs Trade P&L: Long {long_label} / Short {short_label} (β-Neutral)\n"
-        f"Final PnL: ${pair_final:,.0f}  |  Sharpe (Period): {pair_sharpe:.2f}  "
-        f"|  Max DD: ${pair_mdd:,.0f}  |  Borrow: 50bps",
+        f"{case_label}\nPairs Trade Cumulative Return: Long {long_label} / Short {short_label}  "
+        f"|  Constant β = {const_beta:.4f}\n"
+        f"Final Return: {pair_final:.2f}%  |  Sharpe (Period): {pair_sharpe:.2f}  "
+        f"|  Max DD: {pair_mdd:.2f}%  |  Borrow: 50bps",
         fontweight='bold', pad=12
     )
-    ax1.set_ylabel("Cumulative P&L ($)")
+    ax1.set_ylabel("Cumulative Return (%)")
     ax1.legend(loc='upper left', fontsize=10)
 
     trans = transforms.blended_transform_factory(ax1.transData, ax1.transAxes)
@@ -929,29 +954,31 @@ def backtest_realworld_pairs_trade(df, trade_entry_date, case_label,
     ax2 = axes[1]
     long_key  = f'Long {long_label} Only'
     short_key = f'Short {short_label} Only'
-    ax2.plot(dates, tw['LONG_Cum_PnL'], color='#d62728', linewidth=2,
+    ax2.plot(dates, tw['LONG_Cum_Ret'], color='#d62728', linewidth=2,
              linestyle='--',
-             label=f"Long {long_label} Only  (${metrics[long_key]['Final PnL']:,.0f})")
-    ax2.plot(dates, tw['SHORT_Cum_PnL'], color='#ff7f0e', linewidth=2,
+             label=f"Long {long_label} Only  ({metrics[long_key]['Final Ret %']:.2f}%)")
+    ax2.plot(dates, tw['SHORT_Cum_Ret'], color='#ff7f0e', linewidth=2,
              linestyle='--',
-             label=f"Short {short_label} Only (${metrics[short_key]['Final PnL']:,.0f})")
-    ax2.plot(dates, tw['PAIR_Cum_PnL'], color='#2ca02c', linewidth=2.5,
-             label=f"Pairs Trade β-Neutral (${pair_final:,.0f})")
+             label=f"Short {short_label} Only ({metrics[short_key]['Final Ret %']:.2f}%)")
+    ax2.plot(dates, tw['PAIR_Cum_Ret'], color='#2ca02c', linewidth=2.5,
+             label=f"Pairs Trade β={const_beta:.3f} ({pair_final:.2f}%)")
     ax2.axhline(0, color='black', linestyle='--', alpha=0.4)
+    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.1f}%'))
     ax2.set_title("Individual Leg Benchmarks vs. Pairs Strategy",
                   fontweight='bold', pad=8)
-    ax2.set_ylabel("Cumulative P&L ($)")
+    ax2.set_ylabel("Cumulative Return (%)")
     ax2.legend(loc='upper left', fontsize=10)
 
     # Panel 3 — Drawdown
     ax3 = axes[2]
-    ax3.fill_between(dates, tw['PAIR_Drawdown'], 0, color='#d62728', alpha=0.4)
-    ax3.plot(dates, tw['PAIR_Drawdown'], color='#d62728', linewidth=1.5,
+    ax3.fill_between(dates, tw['PAIR_Drawdown_Pct'], 0, color='#d62728', alpha=0.4)
+    ax3.plot(dates, tw['PAIR_Drawdown_Pct'], color='#d62728', linewidth=1.5,
              label='Drawdown')
     ax3.axhline(pair_mdd, color='darkred', linestyle=':', linewidth=1.5,
-                label=f"Max Drawdown: ${pair_mdd:,.0f}")
-    ax3.set_title("Pairs Strategy Drawdown", fontweight='bold', pad=8)
-    ax3.set_ylabel("Drawdown ($)")
+                label=f'Max Drawdown: {pair_mdd:.2f}%')
+    ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.1f}%'))
+    ax3.set_title("Pairs Strategy Drawdown (%)", fontweight='bold', pad=8)
+    ax3.set_ylabel("Drawdown (%)")
     ax3.legend(loc='lower left', fontsize=10)
 
     ax3.xaxis.set_major_locator(mdates.MonthLocator())
@@ -984,10 +1011,10 @@ def run_realworld_validation():
     print("=" * 60)
     print("""
   Methodology note:
-  In both cases below we apply the identical strategy from the WBD analysis:
+  In all cases below we apply the identical strategy from the WBD analysis:
     • Long the party that walked away / kept a clean balance sheet
     • Short the party that won and levered up
-    • Beta-neutral hedge ratio (20-day rolling, lagged 1 day)
+    • Constant beta estimated via OLS on the pre-entry window, locked in at entry
     • 50 bps annualised borrow cost on the short leg
     • $100,000 notional, 4.5% risk-free rate
   """)
@@ -1063,7 +1090,7 @@ def run_realworld_validation():
     print("\n" + "=" * 60)
     print("  CROSS-CASE SUMMARY (Pairs Trade β-Neutral leg only)")
     print("=" * 60)
-    print(f"  {'Case':<40} {'Final PnL':>12} {'Sharpe(P)':>12} {'Max DD':>12}")
+    print(f"  {'Case':<40} {'Final Ret':>12} {'Sharpe(P)':>12} {'Max DD':>12}")
     print(f"  {'-'*76}")
 
     case_labels = {
@@ -1075,9 +1102,9 @@ def run_realworld_validation():
         if results[key]:
             m = results[key]['Pairs Trade (β-Neutral)']
             print(f"  {label:<40} "
-                  f"${m['Final PnL']:>10,.0f}  "
+                  f"{m['Final Ret %']:>10.2f}%  "
                   f"{m['Sharpe (Period)']:>11.2f}  "
-                  f"${m['Max Drawdown']:>10,.0f}")
+                  f"{m['Max Drawdown %']:>10.2f}%")
 
     print(f"\n  WBD (synthetic):  see primary backtest output above.")
     print(f"  Consistent positive PnL across all cases supports")
