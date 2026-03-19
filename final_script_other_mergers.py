@@ -109,8 +109,8 @@ RISK_FREE    = 0.045
 TRADING_DAYS = 252
 BORROW_COST  = 0.0050
 HEDGE_WINDOW = 20
-ZSCORE_ENTRY = 2.0
-ZSCORE_EXIT  = 0.0
+ZSCORE_ENTRY = 2.0   # breach ±this to open/flip position
+ZSCORE_EXIT  = 0.5   # must revert inside ±this to exit — 0.5 keeps you in longer
 OUTPUT_DIR   = 'charts/validation'
 
 COLORS = {
@@ -235,11 +235,17 @@ def _dynamic_positions(z_lagged):
     return pos
 
 
-def _pair_pnl(tw, beta, positions):
+def _pair_pnl(tw, beta, positions, long_ret_col='LONG_LogRet',
+              short_ret_col='SHORT_LogRet'):
+    """
+    Daily pair P&L using true daily returns (exp(log_ret) - 1).
+    beta can be a scalar (constant) or a column name string (rolling).
+    positions is a Series of +1 / -1 / 0.
+    """
     bd = BORROW_COST / TRADING_DAYS
     b  = tw[beta] if isinstance(beta, str) else beta
     return (
-        positions * (CAPITAL * tw['LONG_Ret'] - CAPITAL * b * tw['SHORT_Ret'])
+        positions * (CAPITAL * tw[long_ret_col] - CAPITAL * b * tw[short_ret_col])
         - np.abs(positions) * CAPITAL * b * bd
     )
 
@@ -289,13 +295,21 @@ def run_all_backtests(df, entry_date):
     if tw.empty:
         return None, {}
 
+    # Simple pct returns (kept for beta estimation consistency)
     tw['LONG_Ret']  = tw['LONG'].pct_change().fillna(0)
     tw['SHORT_Ret'] = tw['SHORT'].pct_change().fillna(0)
+    # Log returns → exponentiated back to true daily returns for PnL
+    # exp(log_return) - 1 == true simple return; avoids Jensen's inequality
+    # bias that accumulates when you sum simple returns over a path
+    tw['LONG_LogRet']  = (np.log(tw['LONG']  / tw['LONG'].shift(1))
+                          .fillna(0).apply(lambda x: np.exp(x) - 1))
+    tw['SHORT_LogRet'] = (np.log(tw['SHORT'] / tw['SHORT'].shift(1))
+                          .fillna(0).apply(lambda x: np.exp(x) - 1))
     bd = BORROW_COST / TRADING_DAYS
 
-    # Individual legs (reference lines on charts)
-    tw['LONG_Daily_PnL']  = CAPITAL * tw['LONG_Ret']
-    tw['SHORT_Daily_PnL'] = -CAPITAL * tw['SHORT_Ret'] - CAPITAL * bd
+    # Individual legs (reference lines on charts) — using true log returns
+    tw['LONG_Daily_PnL']  = CAPITAL * tw['LONG_LogRet']
+    tw['SHORT_Daily_PnL'] = -CAPITAL * tw['SHORT_LogRet'] - CAPITAL * bd
     tw['LONG_Cum_Ret']    = (tw['LONG_Daily_PnL'].cumsum()  / CAPITAL) * 100
     tw['SHORT_Cum_Ret']   = (tw['SHORT_Daily_PnL'].cumsum() / CAPITAL) * 100
 
@@ -456,7 +470,143 @@ def chart_spread_zscore(df, case, case_key):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHART 3 — ALL FOUR STRATEGIES OVERLAID
+# CHART 3a — PER-STRATEGY INDIVIDUAL CHARTS (one file per strategy per case)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def chart_per_strategy(tw, metrics, case, case_key):
+    """
+    Generates one dedicated chart per strategy (4 files per case):
+      <case>_S1_const_static.png
+      <case>_S2_const_dynamic.png
+      <case>_S3_roll_static.png
+      <case>_S4_roll_dynamic.png
+
+    Each chart has:
+      Panel 1 — Cumulative return (%) with profit/loss shading and individual legs
+      Panel 2 — Drawdown (%)
+      Panel 3 — Position signal (dynamic strategies only; skipped for S1/S3)
+    """
+    if tw is None:
+        return
+
+    dates  = tw['Date']
+    entry  = pd.to_datetime(case['entry_date'])
+    fmt    = pct_fmt()
+    lt, st = case['long_ticker'], case['short_ticker']
+
+    sid_filenames = {
+        'S1': 'S1_const_static',
+        'S2': 'S2_const_dynamic',
+        'S3': 'S3_roll_static',
+        'S4': 'S4_roll_dynamic',
+    }
+
+    for sid, fname in sid_filenames.items():
+        m         = metrics[sid]
+        is_dyn    = m['Entry Type'] == 'Dynamic'
+        n_panels  = 3 if is_dyn else 2
+        ratios    = [3, 1.5, 1] if is_dyn else [3, 1.5]
+
+        fig, axes = plt.subplots(n_panels, 1, figsize=(16, 5 * n_panels),
+                                 gridspec_kw={'height_ratios': ratios},
+                                 sharex=True)
+        if n_panels == 2:
+            axes = list(axes)  # ensure indexable
+
+        # ── Panel 1: Cumulative return ────────────────────────────────
+        ax1 = axes[0]
+        ax1.plot(dates, tw['LONG_Cum_Ret'],  color='#aec7e8', linewidth=1.2,
+                 linestyle=':', label=f'Long {lt} only  '
+                                      f'({tw["LONG_Cum_Ret"].iloc[-1]:.1f}%)')
+        ax1.plot(dates, tw['SHORT_Cum_Ret'], color='#ffbb78', linewidth=1.2,
+                 linestyle=':', label=f'Short {st} only  '
+                                      f'({tw["SHORT_Cum_Ret"].iloc[-1]:.1f}%)')
+        ax1.plot(dates, tw[f'{sid}_Cum_Ret'], color=COLORS[sid], linewidth=2.5,
+                 label=f"{LABELS[sid]}  ({m['Final Ret %']:.1f}%)")
+        ax1.axhline(0, color='black', linestyle='--', alpha=0.4)
+        ax1.fill_between(dates, tw[f'{sid}_Cum_Ret'], 0,
+                         where=(tw[f'{sid}_Cum_Ret'] >= 0),
+                         color=COLORS[sid], alpha=0.10)
+        ax1.fill_between(dates, tw[f'{sid}_Cum_Ret'], 0,
+                         where=(tw[f'{sid}_Cum_Ret'] < 0),
+                         color='#d62728', alpha=0.10)
+        ax1.yaxis.set_major_formatter(fmt)
+        ax1.set_ylabel('Cumulative Return (%)')
+        ax1.legend(loc='upper left', fontsize=10)
+        add_entry_vline(ax1, entry)
+
+        # Build beta info string for title
+        if m['Beta Type'] == 'Constant':
+            beta_str = f"Constant β = {m['Const Beta']:.4f}  ({m['Pre-Entry Days']} pre-entry days)"
+        else:
+            beta_str = (f"Rolling β (20-day)  entry={m['Beta Entry']:.3f}  "
+                        f"mean={m['Beta Mean']:.3f}  range={m['Beta Range']}")
+
+        if is_dyn:
+            entry_str = (f"Dynamic entry (±{ZSCORE_ENTRY}σ / exit {ZSCORE_EXIT}σ)  "
+                         f"in-market={m['Days in Market']}d  "
+                         f"({m['Long Days']} std / {m['Short Days']} inv)")
+        else:
+            entry_str = "Static entry — hold from catalyst date"
+
+        ax1.set_title(
+            f"{case['title']} — {LABELS[sid]}\n"
+            f"{beta_str}\n"
+            f"{entry_str}\n"
+            f"Return: {m['Final Ret %']:.2f}%  |  "
+            f"Sharpe (Period): {m['Sharpe (Period)']:.2f}  |  "
+            f"Sharpe (Annual): {m['Sharpe (Annual)']:.2f}  |  "
+            f"Max DD: {m['Max Drawdown %']:.2f}%  |  "
+            f"Win Rate: {m['Win Rate']:.1f}%",
+            pad=12
+        )
+
+        # ── Panel 2: Drawdown ─────────────────────────────────────────
+        ax2 = axes[1]
+        ax2.fill_between(dates, tw[f'{sid}_Drawdown'], 0,
+                         color='#d62728', alpha=0.35)
+        ax2.plot(dates, tw[f'{sid}_Drawdown'], color='#d62728', linewidth=1.5,
+                 label=f"Drawdown (max: {m['Max Drawdown %']:.2f}%)")
+        ax2.axhline(m['Max Drawdown %'], color='darkred', linestyle=':',
+                    linewidth=1.2, label=f"Max DD: {m['Max Drawdown %']:.2f}%")
+        ax2.axhline(0, color='black', linewidth=0.8, alpha=0.4)
+        ax2.yaxis.set_major_formatter(fmt)
+        ax2.set_ylabel('Drawdown (%)')
+        ax2.legend(loc='lower left', fontsize=10)
+        ax2.set_title('Drawdown (%)', fontweight='bold', pad=6)
+
+        # ── Panel 3: Position signal (dynamic only) ───────────────────
+        if is_dyn:
+            ax3 = axes[2]
+            pos = tw[f'{sid}_Position']
+            ax3.fill_between(dates, pos, 0, where=(pos > 0),
+                             color='#2ca02c', alpha=0.55,
+                             label=f'Standard: Long {lt} / Short {st}')
+            ax3.fill_between(dates, pos, 0, where=(pos < 0),
+                             color='#d62728', alpha=0.55,
+                             label=f'Inverted: Short {lt} / Long {st}')
+            ax3.axhline(0, color='black', linewidth=0.8, alpha=0.5)
+            ax3.set_yticks([-1, 0, 1])
+            ax3.set_yticklabels(['Inverted', 'Flat', 'Standard'], fontsize=9)
+            ax3.set_ylabel('Position')
+            ax3.legend(loc='upper right', fontsize=10)
+            ax3.set_title('Position Signal (lagged 1-day z-score)',
+                          fontweight='bold', pad=6)
+
+        # X-axis on bottom panel
+        axes[-1].xaxis.set_major_locator(mdates.MonthLocator())
+        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+        plt.setp(axes[-1].xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        plt.tight_layout(h_pad=2)
+        path = f"{OUTPUT_DIR}/{case_key}_{fname}.png"
+        plt.savefig(path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        print(f"       Saved {LABELS[sid]:<24} → {path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHART 3b — ALL FOUR STRATEGIES OVERLAID
 # ══════════════════════════════════════════════════════════════════════════════
 
 def chart_all_strategies(tw, metrics, case, case_key):
@@ -796,6 +946,8 @@ def main():
         print(f"\n  Generating charts...")
         chart_normalized_returns(df, case, case_key)
         chart_spread_zscore(df, case, case_key)
+        print(f"  Per-strategy charts:")
+        chart_per_strategy(tw, metrics, case, case_key)
         chart_all_strategies(tw, metrics, case, case_key)
         chart_dynamic_signals(tw, metrics, case, case_key)
 
@@ -833,6 +985,10 @@ def main():
     print(f"\n  Per-case files (× 3 cases):")
     print(f"    <case>_1_normalized_returns.png")
     print(f"    <case>_2_spread_zscore.png          (const-β + rolling-β panels)")
+    print(f"    <case>_S1_const_static.png           (S1 dedicated chart)")
+    print(f"    <case>_S2_const_dynamic.png          (S2 dedicated chart + signal)")
+    print(f"    <case>_S3_roll_static.png            (S3 dedicated chart)")
+    print(f"    <case>_S4_roll_dynamic.png           (S4 dedicated chart + signal)")
     print(f"    <case>_3_all_strategies.png          (all 4 strategies overlaid)")
     print(f"    <case>_4_dynamic_signals.png         (S2 + S4 position signals)")
     print(f"\n  Summary files:")
