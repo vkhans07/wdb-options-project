@@ -1,6 +1,6 @@
 # Quant Project: WBD Deal Analysis & Event-Driven Trading
 
-**Authors:** Vijay Hans, Kamil Sikora, Estella  
+**Authors:** Vijay Hans, Kamil Sikora, Estella Zhang
 
 ---
 
